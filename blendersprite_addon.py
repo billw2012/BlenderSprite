@@ -199,87 +199,62 @@ def _run_pack(export_root, spritesheet_root):
     return generated, skipped, errors
 
 
-def _run_render(context, export_root):
+
+def _build_job_queue(context, export_root):
     """
-    Core render logic. Returns a (rendered, skipped, errors) tuple.
+    Build the full list of render jobs. Each job is a dict describing one
+    action/layer/direction combination. Skipped jobs are excluded up front.
+    Returns (jobs, skipped_count) or (None, error_message) on failure.
     """
     scene = context.scene
+    settings = scene.blendersprite
 
-    armature_obj = context.scene.blendersprite.armature
+    armature_obj = settings.armature
     if armature_obj is None:
-        _log("ERROR: No armature selected in the BlenderSprite panel.")
-        return 0, 0, 1
+        return None, "No armature selected"
 
-    camera_rig = context.scene.blendersprite.camera_rig
+    camera_rig = settings.camera_rig
     if camera_rig is None:
-        _log("ERROR: No camera rig selected in the BlenderSprite panel.")
-        return 0, 0, 1
+        return None, "No camera rig selected"
 
     chr_actions = [a for a in bpy.data.actions if a.name.startswith("chr_")]
     if not chr_actions:
-        _log("WARNING: No actions found with prefix 'chr_'. Nothing to render.")
-        return 0, 0, 0
+        return None, "No actions found with prefix 'chr_'"
 
-    view_layers = _resolve_view_layers(scene, context.scene.blendersprite.view_layers_filter)
+    view_layers = _resolve_view_layers(scene, settings.view_layers_filter)
     if not view_layers:
-        _log("WARNING: No view layers to render.")
-        return 0, 0, 0
+        return None, "No view layers to render"
 
     _log(f"Found {len(chr_actions)} action(s): {[a.name for a in chr_actions]}")
     _log(f"View layers : {[vl.name for vl in view_layers]}")
     _log(f"Directions  : {list(DIRECTIONS.keys())}")
 
-    rendered = 0
+    jobs = []
     skipped = 0
-    errors = 0
-
     for action in chr_actions:
-        action_name = action.name
         frame_start = int(action.frame_range[0])
         frame_end = int(action.frame_range[1])
         expected_frames = frame_end - frame_start + 1
-
-        _log(f"\n--- Action: {action_name}  frames {frame_start}–{frame_end} ({expected_frames} frames) ---")
-
-        if armature_obj.animation_data is None:
-            armature_obj.animation_data_create()
-        armature_obj.animation_data.action = action
-
-        scene.frame_start = frame_start
-        scene.frame_end = frame_end
-
         for vl in view_layers:
-            context.window.view_layer = vl
-
             for direction_name, angle_radians in DIRECTIONS.items():
-                out_folder = os.path.join(
-                    export_root, action_name, vl.name, direction_name
-                )
-
-                existing = _count_existing_frames(out_folder, expected_frames)
-                if existing >= expected_frames:
-                    _log(f"  SKIP  {action_name}/{vl.name}/{direction_name} "
-                         f"({existing}/{expected_frames} frames already exist)")
+                out_folder = os.path.join(export_root, action.name, vl.name, direction_name)
+                if _count_existing_frames(out_folder, expected_frames) >= expected_frames:
+                    _log(f"  SKIP  {action.name}/{vl.name}/{direction_name} ({expected_frames} frames exist)")
                     skipped += 1
                     continue
-
-                _log(f"  RENDER {action_name}/{vl.name}/{direction_name}  "
-                     f"angle={math.degrees(angle_radians):.0f}°")
-
-                camera_rig.rotation_euler.z = angle_radians
-
-                os.makedirs(out_folder, exist_ok=True)
-                scene.render.filepath = out_folder + "/"
-
-                try:
-                    bpy.ops.render.render(animation=True)
-                    rendered += 1
-                    _log(f"    Done — {expected_frames} frame(s) written to {out_folder}")
-                except Exception as exc:
-                    _log(f"    ERROR rendering {action_name}/{vl.name}/{direction_name}: {exc}")
-                    errors += 1
-
-    return rendered, skipped, errors
+                jobs.append({
+                    "action": action,
+                    "vl_name": vl.name,
+                    "direction_name": direction_name,
+                    "angle_radians": angle_radians,
+                    "out_folder": out_folder,
+                    "frame_start": frame_start,
+                    "frame_end": frame_end,
+                    "expected_frames": expected_frames,
+                    "armature_obj": armature_obj,
+                    "camera_rig": camera_rig,
+                })
+    return jobs, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -287,31 +262,33 @@ def _run_render(context, export_root):
 # ---------------------------------------------------------------------------
 
 class BlenderSpriteSettings(bpy.types.PropertyGroup):
-    armature: bpy.props.PointerProperty(
+    armature: bpy.props.PointerProperty(  # type: ignore
         name="Armature",
         description="Armature to render actions from",
         type=bpy.types.Object,
         poll=lambda self, obj: obj.type == 'ARMATURE',
     )
-    camera_rig: bpy.props.PointerProperty(
+    camera_rig: bpy.props.PointerProperty(  # type: ignore
         name="Camera Rig",
         description="Empty (or object) to rotate for direction changes",
         type=bpy.types.Object,
         poll=lambda self, obj: obj.type == 'EMPTY',
     )
-    view_layers_filter: bpy.props.StringProperty(
+    view_layers_filter: bpy.props.StringProperty(  # type: ignore
         name="View Layers",
         description="Comma-separated view layers to render. Leave blank to render all",
         default="",
     )
-    last_result: bpy.props.StringProperty(default="")
-    export_root: bpy.props.StringProperty(
+    progress: bpy.props.StringProperty(default="")  # type: ignore
+    progress_factor: bpy.props.FloatProperty(default=0.0)  # type: ignore
+    last_result: bpy.props.StringProperty(default="")  # type: ignore
+    export_root: bpy.props.StringProperty(  # type: ignore
         name="Export Root",
         description="Folder for rendered frames. Leave blank to use <blend file dir>/export",
         subtype='DIR_PATH',
         default="",
     )
-    spritesheet_root: bpy.props.StringProperty(
+    spritesheet_root: bpy.props.StringProperty(  # type: ignore
         name="Spritesheet Root",
         description="Folder for packed sprite sheets. Leave blank to use <blend file dir>/spritesheets",
         subtype='DIR_PATH',
@@ -330,39 +307,135 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
     bl_label = "Render All"
     bl_options = {"REGISTER"}
 
+    _timer = None
+    _jobs = []
+    _job_index = 0
+    _skipped = 0
+    _rendered = 0
+    _errors = 0
+    _export_root = ""
+    _spritesheet_root = ""
+
     def execute(self, context):
         settings = context.scene.blendersprite
-        export_root = _resolve_path(settings.export_root, "export")
-        spritesheet_root = _resolve_path(settings.spritesheet_root, "spritesheets")
+        self._export_root = _resolve_path(settings.export_root, "export")
+        self._spritesheet_root = _resolve_path(settings.spritesheet_root, "spritesheets")
 
-        if not export_root:
+        if not self._export_root:
             self.report({"ERROR"}, "Save the .blend file first, or set an explicit Export Root path.")
             return {"CANCELLED"}
 
         _log("=== BlenderSprite: Render All started ===")
-        _log(f"Export root     : {export_root}")
-        _log(f"Spritesheet root: {spritesheet_root}")
+        _log(f"Export root     : {self._export_root}")
+        _log(f"Spritesheet root: {self._spritesheet_root}")
 
-        rendered, skipped, errors = _run_render(context, export_root)
+        jobs, result = _build_job_queue(context, self._export_root)
+        if jobs is None:
+            self.report({"ERROR"}, result)
+            return {"CANCELLED"}
 
-        _log(f"\n=== Render complete — rendered {rendered}, skipped {skipped}, errors {errors} ===")
-        _log(f"\n=== BlenderSprite: Packing sprites ===")
+        self._jobs = jobs
+        self._skipped = result  # skipped count returned as second value
+        self._job_index = 0
+        self._rendered = 0
+        self._errors = 0
 
-        packed, pack_skipped, pack_errors = _run_pack(export_root, spritesheet_root)
+        if not jobs:
+            _log("Nothing to render — all jobs skipped.")
+            self._finish(context)
+            return {"FINISHED"}
 
-        _log(f"\n=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
+        context.scene.blendersprite.last_result = ""
+        context.window_manager.progress_begin(0, len(self._jobs))
+        self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
 
-        total_errors = errors + pack_errors
-        lines = [
-            f"Rendered: {rendered}  Skipped: {skipped}  Errors: {errors}",
+    def modal(self, context, event):
+        # Redraw the panel each tick so progress updates are visible
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        if event.type == "ESC":
+            return self.cancel(context)
+
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+
+        if self._job_index >= len(self._jobs):
+            self._finish(context)
+            return {"FINISHED"}
+
+        job = self._jobs[self._job_index]
+        scene = context.scene
+        action = job["action"]
+        armature_obj = job["armature_obj"]
+        camera_rig = job["camera_rig"]
+
+        label = f"{action.name} / {job['vl_name']} / {job['direction_name']}"
+        _log(f"  RENDER {label}  angle={math.degrees(job['angle_radians']):.0f}°")
+        scene.blendersprite.progress = (
+            f"{label}  ({self._job_index + 1}/{len(self._jobs)})"
+        )
+        scene.blendersprite.progress_factor = self._job_index / len(self._jobs)
+        context.window_manager.progress_update(self._job_index)
+
+        if armature_obj.animation_data is None:
+            armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+        scene.frame_start = job["frame_start"]
+        scene.frame_end = job["frame_end"]
+
+        vl = scene.view_layers.get(job["vl_name"])
+        if vl:
+            context.window.view_layer = vl
+
+        camera_rig.rotation_euler.z = job["angle_radians"]
+        os.makedirs(job["out_folder"], exist_ok=True)
+        scene.render.filepath = job["out_folder"] + "/"
+
+        try:
+            bpy.ops.render.render(animation=True)
+            self._rendered += 1
+            _log(f"    Done — {job['expected_frames']} frame(s) written")
+        except Exception as exc:
+            _log(f"    ERROR: {exc}")
+            self._errors += 1
+
+        self._job_index += 1
+        return {"RUNNING_MODAL"}
+
+    def cancel(self, context):
+        _log("=== BlenderSprite: Cancelled ===")
+        context.window_manager.event_timer_remove(self._timer)
+        context.window_manager.progress_end()
+        context.scene.blendersprite.progress = ""
+        context.scene.blendersprite.progress_factor = 0.0
+        context.scene.blendersprite.last_result = (
+            f"Cancelled after {self._rendered} rendered, {self._skipped} skipped, {self._errors} errors"
+        )
+        return {"CANCELLED"}
+
+    def _finish(self, context):
+        context.window_manager.event_timer_remove(self._timer)
+        context.window_manager.progress_end()
+        context.scene.blendersprite.progress = ""
+        context.scene.blendersprite.progress_factor = 0.0
+
+        _log(f"\n=== Render complete — rendered {self._rendered}, skipped {self._skipped}, errors {self._errors} ===")
+        _log("=== BlenderSprite: Packing sprites ===")
+
+        packed, pack_skipped, pack_errors = _run_pack(self._export_root, self._spritesheet_root)
+
+        _log(f"=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
+
+        total_errors = self._errors + pack_errors
+        context.scene.blendersprite.last_result = "\n".join([
+            f"Rendered: {self._rendered}  Skipped: {self._skipped}  Errors: {self._errors}",
             f"Sheets: {packed}  Skipped: {pack_skipped}  Errors: {pack_errors}",
-        ]
-        context.scene.blendersprite.last_result = "\n".join(lines)
-
-        summary = f"Render {rendered} | Pack {packed} | Errors {total_errors}"
-        self.report({"WARNING"} if total_errors > 0 else {"INFO"}, summary)
-
-        return {"FINISHED"}
+        ])
+        self.report({"WARNING"} if total_errors > 0 else {"INFO"},
+                    f"Render {self._rendered} | Pack {packed} | Errors {total_errors}")
 
 
 # ---------------------------------------------------------------------------
@@ -418,11 +491,15 @@ class BLENDERSPRITE_PT_Main(bpy.types.Panel):
             for icon, text in issues:
                 layout.label(text=text, icon=icon)
 
-        # Disable button if any blocking issues exist
-        blocking = any(icon == "ERROR" for icon, _ in issues)
-        row = layout.row()
-        row.enabled = not blocking
-        row.operator("blendersprite.render_all", icon="RENDER_ANIMATION")
+        layout.separator()
+        if settings.progress:
+            layout.progress(factor=settings.progress_factor, type="BAR", text=settings.progress)
+            layout.label(text="Press ESC to cancel", icon="X")
+        else:
+            blocking = any(icon == "ERROR" for icon, _ in issues)
+            row = layout.row()
+            row.enabled = not blocking
+            row.operator("blendersprite.render_all", icon="RENDER_ANIMATION")
 
         if settings.last_result:
             layout.separator()

@@ -222,6 +222,44 @@ def _run_pack(export_root, spritesheet_root):
 
 
 
+def _get_cloth_objects_in_layer(view_layer):
+    """Return mesh objects with a Cloth modifier that are renderable in this view layer."""
+    return [
+        obj for obj in view_layer.objects
+        if not obj.hide_render
+        and any(m.type == 'CLOTH' for m in obj.modifiers)
+    ]
+
+
+def _bake_cloth(context, view_layers, chr_actions, warmup_frames):
+    """
+    Bake cloth for every unique cloth object visible across the given view layers.
+    Frame range: min(action starts) - warmup_frames  to  max(action ends).
+    Returns number of objects baked.
+    """
+    bake_start = min(int(a.frame_range[0]) for a in chr_actions) - warmup_frames
+    bake_end   = max(int(a.frame_range[1]) for a in chr_actions)
+    _log(f"Cloth bake range: {bake_start} → {bake_end}  (warmup: {warmup_frames} frames)")
+
+    baked = set()
+    for vl in view_layers:
+        for obj in _get_cloth_objects_in_layer(vl):
+            if obj.name in baked:
+                continue
+            _log(f"  Baking cloth '{obj.name}'...")
+            for mod in obj.modifiers:
+                if mod.type != 'CLOTH':
+                    continue
+                mod.point_cache.frame_start = bake_start
+                mod.point_cache.frame_end   = bake_end
+                with context.temp_override(point_cache=mod.point_cache):
+                    bpy.ops.ptcache.free_bake()
+                    bpy.ops.ptcache.bake(bake=True)
+            baked.add(obj.name)
+            _log(f"    Done.")
+    return len(baked)
+
+
 def _build_job_queue(context, export_root):
     """
     Build the full list of render jobs. Each job is a single frame to render.
@@ -249,11 +287,13 @@ def _build_job_queue(context, export_root):
 
     directions = _get_directions(settings.num_directions)
     frame_step = settings.frame_step
+    overwrite = settings.overwrite_frames
 
     _log(f"Found {len(chr_actions)} action(s): {[a.name for a in chr_actions]}")
     _log(f"View layers : {[vl.name for vl in view_layers]}")
     _log(f"Directions  : {[d[0] for d in directions]}  ({len(directions)})")
     _log(f"Frame step  : {frame_step}")
+    _log(f"Overwrite   : {overwrite}")
 
     jobs = []
     skipped = 0
@@ -265,7 +305,7 @@ def _build_job_queue(context, export_root):
         for vl in view_layers:
             for direction_name, angle_radians in directions:
                 out_folder = os.path.join(export_root, action.name, vl.name, direction_name)
-                if _count_existing_frames(out_folder, expected_frames) >= expected_frames:
+                if not overwrite and _count_existing_frames(out_folder, expected_frames) >= expected_frames:
                     _log(f"  SKIP  {action.name}/{vl.name}/{direction_name} ({expected_frames} frames exist)")
                     skipped += 1
                     continue
@@ -326,8 +366,25 @@ class BlenderSpriteSettings(bpy.types.PropertyGroup):
         description="Comma-separated view layers to render. Leave blank to render all",
         default="",
     )
-    progress: bpy.props.StringProperty(default="")  # type: ignore
-    progress_factor: bpy.props.FloatProperty(default=0.0)  # type: ignore
+    bake_cloth: bpy.props.BoolProperty(  # type: ignore
+        name="Bake Cloth",
+        description="Bake cloth simulations before rendering",
+        default=False,
+    )
+    cloth_warmup_frames: bpy.props.IntProperty(  # type: ignore
+        name="Warmup Frames",
+        description="Extra frames before the first action frame for cloth to settle",
+        default=20,
+        min=0,
+        max=500,
+    )
+    overwrite_frames: bpy.props.BoolProperty(  # type: ignore
+        name="Overwrite Existing Frames",
+        description="Re-render and overwrite frames that already exist on disk (instead of skipping them)",
+        default=False,
+    )
+    progress: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})  # type: ignore
+    progress_factor: bpy.props.FloatProperty(default=0.0, options={'SKIP_SAVE'})  # type: ignore
     last_result: bpy.props.StringProperty(default="")  # type: ignore
     export_root: bpy.props.StringProperty(  # type: ignore
         name="Export Root",
@@ -375,6 +432,17 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
         _log("=== BlenderSprite: Render All started ===")
         _log(f"Export root     : {self._export_root}")
         _log(f"Spritesheet root: {self._spritesheet_root}")
+
+        if settings.bake_cloth:
+            chr_actions = [a for a in bpy.data.actions if a.name.startswith("chr_")]
+            view_layers = _resolve_view_layers(context.scene, settings.view_layers_filter)
+            if chr_actions and view_layers:
+                _log("=== Baking cloth ===")
+                context.scene.blendersprite.progress = "Baking cloth..."
+                n = _bake_cloth(context, view_layers, chr_actions, settings.cloth_warmup_frames)
+                _log(f"=== Cloth bake done — {n} object(s) baked ===")
+            else:
+                _log("Skipping cloth bake — no actions or view layers found")
 
         jobs, result = _build_job_queue(context, self._export_root)
         if jobs is None:
@@ -469,8 +537,10 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
     def cancel(self, context):
         _log("=== BlenderSprite: Cancelled ===")
         self._restore_scene(context)
-        context.window_manager.event_timer_remove(self._timer)
-        context.window_manager.progress_end()
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+            context.window_manager.progress_end()
         context.scene.blendersprite.progress = ""
         context.scene.blendersprite.progress_factor = 0.0
         context.scene.blendersprite.last_result = (
@@ -480,8 +550,10 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
 
     def _finish(self, context):
         self._restore_scene(context)
-        context.window_manager.event_timer_remove(self._timer)
-        context.window_manager.progress_end()
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+            context.window_manager.progress_end()
         context.scene.blendersprite.progress = ""
         context.scene.blendersprite.progress_factor = 0.0
 
@@ -521,8 +593,13 @@ class BLENDERSPRITE_PT_Main(bpy.types.Panel):
 
         layout.prop(settings, "armature")
         layout.prop(settings, "camera_rig")
+        row = layout.row(align=True)
+        row.prop(settings, "bake_cloth")
+        if settings.bake_cloth:
+            row.prop(settings, "cloth_warmup_frames")
         layout.prop(settings, "num_directions")
         layout.prop(settings, "frame_step")
+        layout.prop(settings, "overwrite_frames")
         layout.prop(settings, "view_layers_filter")
         layout.prop(settings, "export_root")
         layout.prop(settings, "spritesheet_root")
@@ -588,6 +665,8 @@ _classes = (
 def _set_default_armature(_):
     for scene in bpy.data.scenes:
         settings = scene.blendersprite
+        settings.progress = ""
+        settings.progress_factor = 0.0
         if settings.armature is None:
             rig = bpy.data.objects.get("rig")
             if rig and rig.type == 'ARMATURE':

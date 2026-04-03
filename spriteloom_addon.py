@@ -1,18 +1,18 @@
 """
-blendersprite_addon.py — BlenderSprite Blender Addon
+spriteloom_addon.py — SpriteLoom Blender Addon
 
 Install via: Edit > Preferences > Add-ons > Install... > select this file
 
-Adds a "BlenderSprite" tab in the 3D Viewport N-panel with a
+Adds a "SpriteLoom" tab in the 3D Viewport N-panel with a
 "Render All" button that runs the full render pipeline.
 """
 
 bl_info = {
-    "name": "BlenderSprite",
+    "name": "SpriteLoom",
     "author": "",
     "version": (1, 0, 0),
     "blender": (3, 0, 0),
-    "location": "View3D > Sidebar > BlenderSprite",
+    "location": "View3D > Sidebar > SpriteLoom",
     "description": "Render modular character sprite sheets for all actions, layers, and directions",
     "category": "Render",
 }
@@ -70,7 +70,7 @@ import bpy
 
 
 def _log(msg):
-    print(f"[BlenderSprite] {msg}", flush=True)
+    print(f"[SpriteLoom] {msg}", flush=True)
 
 
 def _resolve_view_layers(scene, filter_str):
@@ -197,7 +197,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     meta = {
         "frames": frames_meta,
         "meta": {
-            "app": "BlenderSprite",
+            "app": "SpriteLoom",
             "image": os.path.basename(sheet_png),
             "format": "RGBA8888",
             "size": {"w": sheet_w, "h": sheet_h},
@@ -319,7 +319,7 @@ def _build_job_queue(context, export_root):
     Returns (jobs, skipped_count) or (None, error_message) on failure.
     """
     scene = context.scene
-    settings = scene.blendersprite
+    settings = scene.spriteloom
 
     armature_obj = settings.armature
     if armature_obj is None:
@@ -394,7 +394,7 @@ def _build_job_queue(context, export_root):
 # Properties
 # ---------------------------------------------------------------------------
 
-class BlenderSpriteSettings(bpy.types.PropertyGroup):
+class SpriteLoomSettings(bpy.types.PropertyGroup):
     armature: bpy.props.PointerProperty(  # type: ignore
         name="Armature",
         description="Armature to render actions from",
@@ -472,6 +472,10 @@ class BlenderSpriteSettings(bpy.types.PropertyGroup):
         description="Each direction gets its own row",
         default=True,
     )
+    show_scene_setup: bpy.props.BoolProperty(default=True)  # type: ignore
+    show_render: bpy.props.BoolProperty(default=True)  # type: ignore
+    show_output: bpy.props.BoolProperty(default=True)  # type: ignore
+    show_sheet_layout: bpy.props.BoolProperty(default=True)  # type: ignore
     progress: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})  # type: ignore
     progress_factor: bpy.props.FloatProperty(default=0.0, options={'SKIP_SAVE'})  # type: ignore
     last_result: bpy.props.StringProperty(default="")  # type: ignore
@@ -493,10 +497,10 @@ class BlenderSpriteSettings(bpy.types.PropertyGroup):
 # Operator
 # ---------------------------------------------------------------------------
 
-class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
+class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
     """Render all chr_ actions × view layers × directions to disk"""
 
-    bl_idname = "blendersprite.render_all"
+    bl_idname = "spriteloom.render_all"
     bl_label = "Render All"
     bl_options = {"REGISTER"}
 
@@ -511,7 +515,7 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
     _spritesheet_root = ""
 
     def execute(self, context):
-        settings = context.scene.blendersprite
+        settings = context.scene.spriteloom
         self._export_root = _resolve_path(settings.export_root, "export")
         self._spritesheet_root = _resolve_path(settings.spritesheet_root, "spritesheets")
 
@@ -519,7 +523,7 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
             self.report({"ERROR"}, "Save the .blend file first, or set an explicit Export Root path.")
             return {"CANCELLED"}
 
-        _log("=== BlenderSprite: Render All started ===")
+        _log("=== SpriteLoom: Render All started ===")
         _log(f"Export root     : {self._export_root}")
         _log(f"Spritesheet root: {self._spritesheet_root}")
 
@@ -542,7 +546,7 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
             self._finish(context)
             return {"FINISHED"}
 
-        context.scene.blendersprite.last_result = ""
+        context.scene.spriteloom.last_result = ""
         context.window_manager.progress_begin(0, self._render_total)
         self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
         context.window_manager.modal_handler_add(self)
@@ -567,8 +571,8 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
 
         if job["type"] == "bake":
             action = job["action"]
-            settings = context.scene.blendersprite
-            context.scene.blendersprite.progress = f"Baking cloth: {action.name}..."
+            settings = context.scene.spriteloom
+            context.scene.spriteloom.progress = f"Baking cloth: {action.name}..."
             for area in context.screen.areas:
                 area.tag_redraw()
             _log(f"=== Baking cloth for '{action.name}' ===")
@@ -589,11 +593,11 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
         frame_total = job["frame_end"] - job["frame_start"] + 1
 
         label = f"{action.name} / {job['vl_name']} / {job['direction_name']}"
-        scene.blendersprite.progress = (
+        scene.spriteloom.progress = (
             f"{label}  frame {frame_num}/{frame_total}  "
             f"({self._rendered + 1}/{self._render_total})"
         )
-        scene.blendersprite.progress_factor = self._rendered / self._render_total if self._render_total else 0.0
+        scene.spriteloom.progress_factor = self._rendered / self._render_total if self._render_total else 0.0
         context.window_manager.progress_update(self._rendered)
 
         if armature_obj.animation_data is None:
@@ -648,20 +652,20 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
 
     def _restore_scene(self, context):
         context.scene.frame_set(self._orig_frame)
-        settings = context.scene.blendersprite
+        settings = context.scene.spriteloom
         if settings.camera_rig and self._orig_camera_rig_z is not None:
             settings.camera_rig.rotation_euler.z = self._orig_camera_rig_z
 
     def cancel(self, context):
-        _log("=== BlenderSprite: Cancelled ===")
+        _log("=== SpriteLoom: Cancelled ===")
         self._restore_scene(context)
         if self._timer is not None:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
             context.window_manager.progress_end()
-        context.scene.blendersprite.progress = ""
-        context.scene.blendersprite.progress_factor = 0.0
-        context.scene.blendersprite.last_result = (
+        context.scene.spriteloom.progress = ""
+        context.scene.spriteloom.progress_factor = 0.0
+        context.scene.spriteloom.last_result = (
             f"Cancelled after {self._rendered} rendered, {self._skipped} skipped, {self._errors} errors"
         )
         return {"CANCELLED"}
@@ -672,13 +676,13 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
             context.window_manager.progress_end()
-        context.scene.blendersprite.progress = ""
-        context.scene.blendersprite.progress_factor = 0.0
+        context.scene.spriteloom.progress = ""
+        context.scene.spriteloom.progress_factor = 0.0
 
         _log(f"\n=== Render complete — rendered {self._rendered}, skipped {self._skipped}, errors {self._errors} ===")
-        _log("=== BlenderSprite: Packing sprites ===")
+        _log("=== SpriteLoom: Packing sprites ===")
 
-        settings = context.scene.blendersprite
+        settings = context.scene.spriteloom
         packed, pack_skipped, pack_errors = _run_pack(
             self._export_root, self._spritesheet_root,
             settings.split_by_action, settings.split_by_layer,
@@ -688,7 +692,7 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
         _log(f"=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
 
         total_errors = self._errors + pack_errors
-        context.scene.blendersprite.last_result = "\n".join([
+        context.scene.spriteloom.last_result = "\n".join([
             f"Rendered: {self._rendered}  Skipped: {self._skipped}  Errors: {self._errors}",
             f"Sheets: {packed}  Skipped: {pack_skipped}  Errors: {pack_errors}",
         ])
@@ -700,45 +704,71 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
 # Panel
 # ---------------------------------------------------------------------------
 
-class BLENDERSPRITE_PT_Main(bpy.types.Panel):
-    """BlenderSprite main sidebar panel"""
+class SPRITELOOM_PT_Main(bpy.types.Panel):
+    """SpriteLoom main sidebar panel"""
 
-    bl_label = "BlenderSprite"
-    bl_idname = "BLENDERSPRITE_PT_Main"
+    bl_label = "SpriteLoom"
+    bl_idname = "SPRITELOOM_PT_Main"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "BlenderSprite"
+    bl_category = "SpriteLoom"
 
     def draw(self, context):
         layout = self.layout
-        settings = context.scene.blendersprite
+        settings = context.scene.spriteloom
         scene = context.scene
 
-        layout.prop(settings, "armature")
-        layout.prop(settings, "camera_rig")
-        row = layout.row(align=True)
-        row.prop(settings, "bake_cloth")
-        if settings.bake_cloth:
-            row.prop(settings, "cloth_warmup_frames")
-        layout.prop(settings, "num_directions")
-        layout.prop(settings, "frame_step")
-        layout.prop(settings, "overwrite_frames")
-        layout.prop(settings, "view_layers_filter")
-        layout.prop(settings, "export_root")
-        layout.prop(settings, "spritesheet_root")
-        row = layout.row()
-        row.prop(settings, "split_by_action")
-        row.prop(settings, "split_by_layer")
+        # --- Scene Setup ---
+        box = layout.box()
+        row = box.row()
+        row.prop(settings, "show_scene_setup", icon="TRIA_DOWN" if settings.show_scene_setup else "TRIA_RIGHT", emboss=False, text="Scene Setup", icon_only=False)
+        row.label(icon="SCENE_DATA")
+        if settings.show_scene_setup:
+            box.prop(settings, "armature")
+            box.prop(settings, "camera_rig")
 
-        layout.label(text="Row splits:")
-        row = layout.row()
-        sub = row.row()
-        sub.enabled = not settings.split_by_action
-        sub.prop(settings, "row_split_by_action")
-        sub = row.row()
-        sub.enabled = not settings.split_by_layer
-        sub.prop(settings, "row_split_by_layer")
-        row.prop(settings, "row_split_by_direction")
+        # --- Render Settings ---
+        box = layout.box()
+        row = box.row()
+        row.prop(settings, "show_render", icon="TRIA_DOWN" if settings.show_render else "TRIA_RIGHT", emboss=False, text="Render", icon_only=False)
+        row.label(icon="RENDER_ANIMATION")
+        if settings.show_render:
+            box.prop(settings, "num_directions")
+            box.prop(settings, "frame_step")
+            row = box.row(align=True)
+            row.prop(settings, "bake_cloth")
+            if settings.bake_cloth:
+                row.prop(settings, "cloth_warmup_frames")
+
+        # --- Output Paths ---
+        box = layout.box()
+        row = box.row()
+        row.prop(settings, "show_output", icon="TRIA_DOWN" if settings.show_output else "TRIA_RIGHT", emboss=False, text="Output", icon_only=False)
+        row.label(icon="FILE_FOLDER")
+        if settings.show_output:
+            box.prop(settings, "view_layers_filter")
+            box.prop(settings, "export_root")
+            box.prop(settings, "spritesheet_root")
+            box.prop(settings, "overwrite_frames")
+
+        # --- Sheet Layout ---
+        box = layout.box()
+        row = box.row()
+        row.prop(settings, "show_sheet_layout", icon="TRIA_DOWN" if settings.show_sheet_layout else "TRIA_RIGHT", emboss=False, text="Sheet Layout", icon_only=False)
+        row.label(icon="IMAGE_DATA")
+        if settings.show_sheet_layout:
+            row = box.row()
+            row.prop(settings, "split_by_action")
+            row.prop(settings, "split_by_layer")
+            box.label(text="Row splits:")
+            row = box.row()
+            sub = row.row()
+            sub.enabled = not settings.split_by_action
+            sub.prop(settings, "row_split_by_action")
+            sub = row.row()
+            sub.enabled = not settings.split_by_layer
+            sub.prop(settings, "row_split_by_layer")
+            row.prop(settings, "row_split_by_direction")
 
         # --- Validation warnings ---
         issues = []
@@ -778,7 +808,7 @@ class BLENDERSPRITE_PT_Main(bpy.types.Panel):
             blocking = any(icon == "ERROR" for icon, _ in issues)
             row = layout.row()
             row.enabled = not blocking
-            row.operator("blendersprite.render_all", icon="RENDER_ANIMATION")
+            row.operator("spriteloom.render_all", icon="RENDER_ANIMATION")
 
         if settings.last_result:
             layout.separator()
@@ -791,16 +821,16 @@ class BLENDERSPRITE_PT_Main(bpy.types.Panel):
 # ---------------------------------------------------------------------------
 
 _classes = (
-    BlenderSpriteSettings,
-    BLENDERSPRITE_OT_RenderAll,
-    BLENDERSPRITE_PT_Main,
+    SpriteLoomSettings,
+    SPRITELOOM_OT_RenderAll,
+    SPRITELOOM_PT_Main,
 )
 
 
 @bpy.app.handlers.persistent
 def _set_default_armature(_):
     for scene in bpy.data.scenes:
-        settings = scene.blendersprite
+        settings = scene.spriteloom
         settings.progress = ""
         settings.progress_factor = 0.0
         if settings.armature is None:
@@ -814,27 +844,30 @@ def _set_default_armature(_):
 
 
 def _purge_render_handlers():
-    """Remove any leftover BlenderSprite render handlers (e.g. from a failed previous run)."""
+    """Remove any leftover SpriteLoom render handlers (e.g. from a failed previous run)."""
     for handler_list in (bpy.app.handlers.render_complete, bpy.app.handlers.render_cancel):
         for h in list(handler_list):
-            if getattr(h, "__qualname__", "").startswith("BLENDERSPRITE_OT_RenderAll"):
+            if getattr(h, "__qualname__", "").startswith("SPRITELOOM_OT_RenderAll"):
                 handler_list.remove(h)
 
 
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.blendersprite = bpy.props.PointerProperty(type=BlenderSpriteSettings)
+    bpy.types.Scene.spriteloom = bpy.props.PointerProperty(type=SpriteLoomSettings)
     bpy.app.handlers.load_post.append(_set_default_armature)
     _purge_render_handlers()
-    # Also apply to any scenes already open
-    _set_default_armature(None)
+    # Also apply to any scenes already open (skipped during install when bpy.data is restricted)
+    try:
+        _set_default_armature(None)
+    except AttributeError:
+        pass
 
 
 def unregister():
     _purge_render_handlers()
     bpy.app.handlers.load_post.remove(_set_default_armature)
-    del bpy.types.Scene.blendersprite
+    del bpy.types.Scene.spriteloom
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
 

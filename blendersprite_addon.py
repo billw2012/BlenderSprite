@@ -25,16 +25,38 @@ import re
 # CONFIGURATION — edit these values before rendering
 # ---------------------------------------------------------------------------
 
-DIRECTIONS = {
-    "north":     0,
-    "northeast": math.pi / 4,
-    "east":      math.pi / 2,
-    "southeast": 3 * math.pi / 4,
-    "south":     math.pi,
-    "southwest": 5 * math.pi / 4,
-    "west":      3 * math.pi / 2,
-    "northwest": 7 * math.pi / 4,
+# All 16 directions in order — subsets are taken by stepping through this list
+_ALL_DIRECTIONS = [
+    ("south",     math.pi),
+    ("southwest", 5 * math.pi / 4),
+    ("west",      3 * math.pi / 2),
+    ("northwest", 7 * math.pi / 4),
+    ("north",     0),
+    ("northeast", math.pi / 4),
+    ("east",      math.pi / 2),
+    ("southeast", 3 * math.pi / 4),
+    ("ssw",       9 * math.pi / 8),
+    ("wsw",       11 * math.pi / 8),
+    ("wnw",       13 * math.pi / 8),
+    ("nnw",       15 * math.pi / 8),
+    ("nne",       math.pi / 8),
+    ("ene",       3 * math.pi / 8),
+    ("ese",       5 * math.pi / 8),
+    ("sse",       7 * math.pi / 8),
+]
+
+_DIRECTION_COUNTS = {
+    "1":  [("south", math.pi)],
+    "4":  [("south", math.pi), ("west", 3*math.pi/2), ("north", 0), ("east", math.pi/2)],
+    "8":  [("south", math.pi), ("southwest", 5*math.pi/4), ("west", 3*math.pi/2),
+           ("northwest", 7*math.pi/4), ("north", 0), ("northeast", math.pi/4),
+           ("east", math.pi/2), ("southeast", 3*math.pi/4)],
+    "16": _ALL_DIRECTIONS,
 }
+
+
+def _get_directions(num_directions_str):
+    return _DIRECTION_COUNTS.get(num_directions_str, _DIRECTION_COUNTS["8"])
 
 FRAME_WIDTH = 64
 FRAME_HEIGHT = 64
@@ -202,8 +224,8 @@ def _run_pack(export_root, spritesheet_root):
 
 def _build_job_queue(context, export_root):
     """
-    Build the full list of render jobs. Each job is a dict describing one
-    action/layer/direction combination. Skipped jobs are excluded up front.
+    Build the full list of render jobs. Each job is a single frame to render.
+    Entire action/layer/direction combos are skipped if all frames already exist.
     Returns (jobs, skipped_count) or (None, error_message) on failure.
     """
     scene = context.scene
@@ -225,35 +247,42 @@ def _build_job_queue(context, export_root):
     if not view_layers:
         return None, "No view layers to render"
 
+    directions = _get_directions(settings.num_directions)
+    frame_step = settings.frame_step
+
     _log(f"Found {len(chr_actions)} action(s): {[a.name for a in chr_actions]}")
     _log(f"View layers : {[vl.name for vl in view_layers]}")
-    _log(f"Directions  : {list(DIRECTIONS.keys())}")
+    _log(f"Directions  : {[d[0] for d in directions]}  ({len(directions)})")
+    _log(f"Frame step  : {frame_step}")
 
     jobs = []
     skipped = 0
     for action in chr_actions:
         frame_start = int(action.frame_range[0])
         frame_end = int(action.frame_range[1])
-        expected_frames = frame_end - frame_start + 1
+        frames = list(range(frame_start, frame_end + 1, frame_step))
+        expected_frames = len(frames)
         for vl in view_layers:
-            for direction_name, angle_radians in DIRECTIONS.items():
+            for direction_name, angle_radians in directions:
                 out_folder = os.path.join(export_root, action.name, vl.name, direction_name)
                 if _count_existing_frames(out_folder, expected_frames) >= expected_frames:
                     _log(f"  SKIP  {action.name}/{vl.name}/{direction_name} ({expected_frames} frames exist)")
                     skipped += 1
                     continue
-                jobs.append({
-                    "action": action,
-                    "vl_name": vl.name,
-                    "direction_name": direction_name,
-                    "angle_radians": angle_radians,
-                    "out_folder": out_folder,
-                    "frame_start": frame_start,
-                    "frame_end": frame_end,
-                    "expected_frames": expected_frames,
-                    "armature_obj": armature_obj,
-                    "camera_rig": camera_rig,
-                })
+                os.makedirs(out_folder, exist_ok=True)
+                for frame in frames:
+                    jobs.append({
+                        "action": action,
+                        "vl_name": vl.name,
+                        "direction_name": direction_name,
+                        "angle_radians": angle_radians,
+                        "out_folder": out_folder,
+                        "frame": frame,
+                        "frame_start": frame_start,
+                        "frame_end": frame_end,
+                        "armature_obj": armature_obj,
+                        "camera_rig": camera_rig,
+                    })
     return jobs, skipped
 
 
@@ -273,6 +302,24 @@ class BlenderSpriteSettings(bpy.types.PropertyGroup):
         description="Empty (or object) to rotate for direction changes",
         type=bpy.types.Object,
         poll=lambda self, obj: obj.type == 'EMPTY',
+    )
+    num_directions: bpy.props.EnumProperty(  # type: ignore
+        name="Directions",
+        description="Number of render directions",
+        items=[
+            ("1",  "1 — South only",  ""),
+            ("4",  "4 — Cardinal",    ""),
+            ("8",  "8 — Octagonal",   ""),
+            ("16", "16 — Full",       ""),
+        ],
+        default="8",
+    )
+    frame_step: bpy.props.IntProperty(  # type: ignore
+        name="Frame Step",
+        description="Render every Nth frame (1 = all frames)",
+        default=1,
+        min=1,
+        max=64,
     )
     view_layers_filter: bpy.props.StringProperty(  # type: ignore
         name="View Layers",
@@ -339,6 +386,10 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
         self._job_index = 0
         self._rendered = 0
         self._errors = 0
+        self._orig_frame = context.scene.frame_current
+        settings = context.scene.blendersprite
+        self._orig_camera_rig_z = settings.camera_rig.rotation_euler.z if settings.camera_rig else None
+
 
         if not jobs:
             _log("Nothing to render — all jobs skipped.")
@@ -371,11 +422,14 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
         action = job["action"]
         armature_obj = job["armature_obj"]
         camera_rig = job["camera_rig"]
+        frame = job["frame"]
+        frame_num = frame - job["frame_start"] + 1
+        frame_total = job["frame_end"] - job["frame_start"] + 1
 
         label = f"{action.name} / {job['vl_name']} / {job['direction_name']}"
-        _log(f"  RENDER {label}  angle={math.degrees(job['angle_radians']):.0f}°")
         scene.blendersprite.progress = (
-            f"{label}  ({self._job_index + 1}/{len(self._jobs)})"
+            f"{label}  frame {frame_num}/{frame_total}  "
+            f"({self._job_index + 1}/{len(self._jobs)})"
         )
         scene.blendersprite.progress_factor = self._job_index / len(self._jobs)
         context.window_manager.progress_update(self._job_index)
@@ -383,30 +437,38 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
         if armature_obj.animation_data is None:
             armature_obj.animation_data_create()
         armature_obj.animation_data.action = action
-        scene.frame_start = job["frame_start"]
-        scene.frame_end = job["frame_end"]
 
         vl = scene.view_layers.get(job["vl_name"])
         if vl:
             context.window.view_layer = vl
 
         camera_rig.rotation_euler.z = job["angle_radians"]
-        os.makedirs(job["out_folder"], exist_ok=True)
-        scene.render.filepath = job["out_folder"] + "/"
+        scene.frame_set(frame)
+        out_path = os.path.join(job["out_folder"], f"{frame:04d}.png")
 
         try:
-            bpy.ops.render.render(animation=True)
+            bpy.ops.render.render(write_still=False)
+            result = bpy.data.images.get("Render Result")
+            if result is None:
+                raise RuntimeError("No render result found after rendering")
+            result.save_render(out_path)
             self._rendered += 1
-            _log(f"    Done — {job['expected_frames']} frame(s) written")
         except Exception as exc:
-            _log(f"    ERROR: {exc}")
+            _log(f"    ERROR {label} frame {frame}: {exc}")
             self._errors += 1
 
         self._job_index += 1
         return {"RUNNING_MODAL"}
 
+    def _restore_scene(self, context):
+        context.scene.frame_set(self._orig_frame)
+        settings = context.scene.blendersprite
+        if settings.camera_rig and self._orig_camera_rig_z is not None:
+            settings.camera_rig.rotation_euler.z = self._orig_camera_rig_z
+
     def cancel(self, context):
         _log("=== BlenderSprite: Cancelled ===")
+        self._restore_scene(context)
         context.window_manager.event_timer_remove(self._timer)
         context.window_manager.progress_end()
         context.scene.blendersprite.progress = ""
@@ -417,6 +479,7 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
         return {"CANCELLED"}
 
     def _finish(self, context):
+        self._restore_scene(context)
         context.window_manager.event_timer_remove(self._timer)
         context.window_manager.progress_end()
         context.scene.blendersprite.progress = ""
@@ -458,6 +521,8 @@ class BLENDERSPRITE_PT_Main(bpy.types.Panel):
 
         layout.prop(settings, "armature")
         layout.prop(settings, "camera_rig")
+        layout.prop(settings, "num_directions")
+        layout.prop(settings, "frame_step")
         layout.prop(settings, "view_layers_filter")
         layout.prop(settings, "export_root")
         layout.prop(settings, "spritesheet_root")
@@ -485,6 +550,7 @@ class BLENDERSPRITE_PT_Main(bpy.types.Panel):
         if not settings.export_root and not bpy.data.filepath:
             issues.append(("ERROR", "No export path — save the .blend file first"))
             issues.append(("INFO", "Hint: or set an explicit Export Root above"))
+
 
         if issues:
             layout.separator()

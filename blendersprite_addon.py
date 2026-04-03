@@ -231,33 +231,37 @@ def _get_cloth_objects_in_layer(view_layer):
     ]
 
 
-def _bake_cloth(context, view_layers, chr_actions, warmup_frames):
+def _bake_cloth_for_action(context, view_layers, action, warmup_frames):
     """
-    Bake cloth for every unique cloth object visible across the given view layers.
-    Frame range: min(action starts) - warmup_frames  to  max(action ends).
+    Bake cloth for a single action. Each action gets a fresh bake so cloth
+    simulation doesn't carry state from the previous action.
+    Frame range: action.frame_start - warmup_frames  to  action.frame_end.
     Returns number of objects baked.
     """
-    bake_start = min(int(a.frame_range[0]) for a in chr_actions) - warmup_frames
-    bake_end   = max(int(a.frame_range[1]) for a in chr_actions)
-    _log(f"Cloth bake range: {bake_start} → {bake_end}  (warmup: {warmup_frames} frames)")
+    bake_start = int(action.frame_range[0]) - warmup_frames
+    bake_end   = int(action.frame_range[1])
+    _log(f"  Cloth bake '{action.name}': frames {bake_start}→{bake_end} (warmup: {warmup_frames})")
 
-    baked = set()
+    cloth_objs = []
+    seen = set()
     for vl in view_layers:
         for obj in _get_cloth_objects_in_layer(vl):
-            if obj.name in baked:
+            if obj.name not in seen:
+                cloth_objs.append(obj)
+                seen.add(obj.name)
+
+    for obj in cloth_objs:
+        for mod in obj.modifiers:
+            if mod.type != 'CLOTH':
                 continue
-            _log(f"  Baking cloth '{obj.name}'...")
-            for mod in obj.modifiers:
-                if mod.type != 'CLOTH':
-                    continue
-                mod.point_cache.frame_start = bake_start
-                mod.point_cache.frame_end   = bake_end
-                with context.temp_override(point_cache=mod.point_cache):
-                    bpy.ops.ptcache.free_bake()
-                    bpy.ops.ptcache.bake(bake=True)
-            baked.add(obj.name)
-            _log(f"    Done.")
-    return len(baked)
+            mod.point_cache.frame_start = bake_start
+            mod.point_cache.frame_end   = bake_end
+            with context.temp_override(point_cache=mod.point_cache):
+                bpy.ops.ptcache.free_bake()
+                bpy.ops.ptcache.bake(bake=True)
+        _log(f"    Baked '{obj.name}'")
+
+    return len(cloth_objs)
 
 
 def _build_job_queue(context, export_root):
@@ -302,6 +306,8 @@ def _build_job_queue(context, export_root):
         frame_end = int(action.frame_range[1])
         frames = list(range(frame_start, frame_end + 1, frame_step))
         expected_frames = len(frames)
+        action_has_jobs = False
+        action_jobs = []
         for vl in view_layers:
             for direction_name, angle_radians in directions:
                 out_folder = os.path.join(export_root, action.name, vl.name, direction_name)
@@ -309,9 +315,16 @@ def _build_job_queue(context, export_root):
                     _log(f"  SKIP  {action.name}/{vl.name}/{direction_name} ({expected_frames} frames exist)")
                     skipped += 1
                     continue
+                if overwrite and os.path.isdir(out_folder):
+                    for f in os.listdir(out_folder):
+                        if f.lower().endswith(".png"):
+                            os.remove(os.path.join(out_folder, f))
+                    _log(f"  CLEAR {action.name}/{vl.name}/{direction_name}")
                 os.makedirs(out_folder, exist_ok=True)
+                action_has_jobs = True
                 for frame in frames:
-                    jobs.append({
+                    action_jobs.append({
+                        "type": "render",
                         "action": action,
                         "vl_name": vl.name,
                         "direction_name": direction_name,
@@ -323,6 +336,9 @@ def _build_job_queue(context, export_root):
                         "armature_obj": armature_obj,
                         "camera_rig": camera_rig,
                     })
+        if action_has_jobs and settings.bake_cloth:
+            jobs.append({"type": "bake", "action": action, "view_layers": view_layers})
+        jobs.extend(action_jobs)
     return jobs, skipped
 
 
@@ -414,6 +430,7 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
     _timer = None
     _jobs = []
     _job_index = 0
+    _render_total = 0
     _skipped = 0
     _rendered = 0
     _errors = 0
@@ -433,31 +450,19 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
         _log(f"Export root     : {self._export_root}")
         _log(f"Spritesheet root: {self._spritesheet_root}")
 
-        if settings.bake_cloth:
-            chr_actions = [a for a in bpy.data.actions if a.name.startswith("chr_")]
-            view_layers = _resolve_view_layers(context.scene, settings.view_layers_filter)
-            if chr_actions and view_layers:
-                _log("=== Baking cloth ===")
-                context.scene.blendersprite.progress = "Baking cloth..."
-                n = _bake_cloth(context, view_layers, chr_actions, settings.cloth_warmup_frames)
-                _log(f"=== Cloth bake done — {n} object(s) baked ===")
-            else:
-                _log("Skipping cloth bake — no actions or view layers found")
-
         jobs, result = _build_job_queue(context, self._export_root)
         if jobs is None:
             self.report({"ERROR"}, result)
             return {"CANCELLED"}
 
         self._jobs = jobs
-        self._skipped = result  # skipped count returned as second value
+        self._skipped = result
         self._job_index = 0
+        self._render_total = sum(1 for j in jobs if j["type"] == "render")
         self._rendered = 0
         self._errors = 0
         self._orig_frame = context.scene.frame_current
-        settings = context.scene.blendersprite
         self._orig_camera_rig_z = settings.camera_rig.rotation_euler.z if settings.camera_rig else None
-
 
         if not jobs:
             _log("Nothing to render — all jobs skipped.")
@@ -465,7 +470,7 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
             return {"FINISHED"}
 
         context.scene.blendersprite.last_result = ""
-        context.window_manager.progress_begin(0, len(self._jobs))
+        context.window_manager.progress_begin(0, self._render_total)
         self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
@@ -486,6 +491,19 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
             return {"FINISHED"}
 
         job = self._jobs[self._job_index]
+
+        if job["type"] == "bake":
+            action = job["action"]
+            settings = context.scene.blendersprite
+            context.scene.blendersprite.progress = f"Baking cloth: {action.name}..."
+            for area in context.screen.areas:
+                area.tag_redraw()
+            _log(f"=== Baking cloth for '{action.name}' ===")
+            _bake_cloth_for_action(context, job["view_layers"], action, settings.cloth_warmup_frames)
+            _log(f"=== Cloth bake done ===")
+            self._job_index += 1
+            return {"RUNNING_MODAL"}
+
         scene = context.scene
         action = job["action"]
         armature_obj = job["armature_obj"]
@@ -497,10 +515,10 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
         label = f"{action.name} / {job['vl_name']} / {job['direction_name']}"
         scene.blendersprite.progress = (
             f"{label}  frame {frame_num}/{frame_total}  "
-            f"({self._job_index + 1}/{len(self._jobs)})"
+            f"({self._rendered + 1}/{self._render_total})"
         )
-        scene.blendersprite.progress_factor = self._job_index / len(self._jobs)
-        context.window_manager.progress_update(self._job_index)
+        scene.blendersprite.progress_factor = self._rendered / self._render_total if self._render_total else 0.0
+        context.window_manager.progress_update(self._rendered)
 
         if armature_obj.animation_data is None:
             armature_obj.animation_data_create()

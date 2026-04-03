@@ -19,7 +19,6 @@ bl_info = {
 
 import math
 import os
-import re
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION — edit these values before rendering
@@ -95,66 +94,95 @@ def _resolve_path(prop_value, blend_relative_default):
     return ""
 
 
+def _frame_filename(action_name, layer_name, direction_name, frame):
+    """Canonical flat filename for a rendered frame. Uses -- to separate semantic parts."""
+    return f"{action_name}--{layer_name}--{direction_name}--{frame:04d}.png"
+
+
 def _count_existing_frames(export_root, action_name, layer_name, direction_name):
     if not os.path.isdir(export_root):
         return 0
-    prefix = f"{action_name}_{layer_name}_{direction_name}_"
+    prefix = f"{action_name}--{layer_name}--{direction_name}--"
     return len([f for f in os.listdir(export_root) if f.startswith(prefix) and f.lower().endswith(".png")])
 
 
-def _numeric_sort_key(filename):
-    numbers = re.findall(r"\d+", filename)
-    return int(numbers[0]) if numbers else 0
+
+def _row_key(f, row_split_by_action, row_split_by_layer, row_split_by_direction):
+    parts = []
+    if row_split_by_action:    parts.append(f["action"])
+    if row_split_by_layer:     parts.append(f["layer"])
+    if row_split_by_direction: parts.append(f["direction"])
+    return tuple(parts)
 
 
-def _pack_folder(np, spritesheet_root, action_name, layer_name, direction_name, filepaths):
-    """Pack a list of PNG filepaths into a sprite sheet using bpy. Returns True on success."""
+def _pack_sheet(np, spritesheet_root, sheet_name, frames,
+                row_split_by_action, row_split_by_layer, row_split_by_direction):
+    """
+    Pack a list of frame dicts into one sprite sheet, optionally split into rows.
+    Each frame dict: {"filepath": str, "action": str, "layer": str, "direction": str, "frame_num": int}
+    Returns True on success.
+    """
     import json
 
-    filepaths = sorted(filepaths, key=lambda p: _numeric_sort_key(os.path.basename(p)))
-    if not filepaths:
-        _log(f"  WARNING: No PNG frames for {action_name}_{layer_name}_{direction_name} — skipping.")
+    frames = sorted(frames, key=lambda f: (f["action"], f["layer"], f["direction"], f["frame_num"]))
+    if not frames:
+        _log(f"  WARNING: No frames for sheet '{sheet_name}' — skipping.")
         return False
 
-    frame_count = len(filepaths)
-    sheet_name = f"{action_name}_{layer_name}_{direction_name}"
+    # Group into rows
+    rows_ordered = []
+    rows_map = {}
+    for f in frames:
+        key = _row_key(f, row_split_by_action, row_split_by_layer, row_split_by_direction)
+        if key not in rows_map:
+            rows_map[key] = []
+            rows_ordered.append(key)
+        rows_map[key].append(f)
+
+    num_rows = len(rows_ordered)
+    cols = max(len(rows_map[k]) for k in rows_ordered)
+    sheet_w = FRAME_WIDTH * cols
+    sheet_h = FRAME_HEIGHT * num_rows
+
     sheet_png = os.path.join(spritesheet_root, f"{sheet_name}.png")
     sheet_json = os.path.join(spritesheet_root, f"{sheet_name}.json")
+    _log(f"  Packing {sheet_name}: {len(frames)} frame(s) in {num_rows} row(s) × {cols} col(s)")
 
-    _log(f"  Packing {sheet_name}: {frame_count} frame(s)")
+    sheet_arr = np.zeros((sheet_h, sheet_w, 4), dtype=np.float32)
+    frames_meta = {}
 
-    sheet_arr = np.zeros((FRAME_HEIGHT, FRAME_WIDTH * frame_count, 4), dtype=np.float32)
-    frames_meta = []
+    for row_idx, key in enumerate(rows_ordered):
+        y_px = row_idx * FRAME_HEIGHT
+        for col_idx, f in enumerate(rows_map[key]):
+            filepath = f["filepath"]
+            filename = os.path.basename(filepath)
+            try:
+                img = bpy.data.images.load(filepath)
+            except Exception as exc:
+                _log(f"    WARNING: Could not load {filename}: {exc} — skipping.")
+                continue
 
-    for i, filepath in enumerate(filepaths):
-        filename = os.path.basename(filepath)
-        try:
-            img = bpy.data.images.load(filepath)
-        except Exception as exc:
-            _log(f"    WARNING: Could not load {filename}: {exc} — skipping frame.")
-            continue
+            if img.size[0] != FRAME_WIDTH or img.size[1] != FRAME_HEIGHT:
+                _log(f"    WARNING: {filename} is {img.size[0]}x{img.size[1]}, "
+                     f"expected {FRAME_WIDTH}x{FRAME_HEIGHT}.")
 
-        if img.size[0] != FRAME_WIDTH or img.size[1] != FRAME_HEIGHT:
-            _log(f"    WARNING: {filename} is {img.size[0]}x{img.size[1]}, "
-                 f"expected {FRAME_WIDTH}x{FRAME_HEIGHT}.")
+            arr = np.array(img.pixels, dtype=np.float32).reshape(img.size[1], img.size[0], 4)
+            bpy.data.images.remove(img)
 
-        # pixels is a flat RGBA float array, row-major, bottom-left origin
-        arr = np.array(img.pixels, dtype=np.float32).reshape(img.size[1], img.size[0], 4)
-        bpy.data.images.remove(img)
+            x_px = col_idx * FRAME_WIDTH
+            sheet_arr[y_px:y_px + FRAME_HEIGHT, x_px:x_px + FRAME_WIDTH, :] = arr[:FRAME_HEIGHT, :FRAME_WIDTH, :]
 
-        x = i * FRAME_WIDTH
-        sheet_arr[:, x:x + FRAME_WIDTH, :] = arr[:FRAME_HEIGHT, :FRAME_WIDTH, :]
+            sprite_name = f"{f['action']}_{f['layer']}_{f['direction']}_{f['frame_num']:04d}"
+            frames_meta[sprite_name] = {
+                "frame": {"x": x_px, "y": y_px, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
+                "rotated": False,
+                "trimmed": False,
+                "spriteSourceSize": {"x": 0, "y": 0, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
+                "sourceSize": {"w": FRAME_WIDTH, "h": FRAME_HEIGHT},
+                "duration": FRAME_DURATION_OVERRIDES.get(f["action"], FRAME_DURATION_MS),
+            }
 
-        duration = FRAME_DURATION_OVERRIDES.get(action_name, FRAME_DURATION_MS)
-        frames_meta.append({
-            "filename": f"{sheet_name}_{i}",
-            "frame": {"x": x, "y": 0, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
-            "duration": duration,
-        })
-
-    sheet_img = bpy.data.images.new(
-        sheet_name, width=FRAME_WIDTH * frame_count, height=FRAME_HEIGHT, alpha=True
-    )
+    sheet_img = bpy.data.images.new(sheet_name, width=sheet_w, height=sheet_h, alpha=True)
     sheet_img.pixels = sheet_arr.flatten().tolist()
     sheet_img.filepath_raw = sheet_png
     sheet_img.file_format = "PNG"
@@ -167,16 +195,14 @@ def _pack_folder(np, spritesheet_root, action_name, layer_name, direction_name, 
     bpy.data.images.remove(sheet_img)
 
     meta = {
-        "meta": {
-            "image": os.path.basename(sheet_png),
-            "size": {"w": FRAME_WIDTH * frame_count, "h": FRAME_HEIGHT},
-            "frameSize": {"w": FRAME_WIDTH, "h": FRAME_HEIGHT},
-            "action": action_name,
-            "layer": layer_name,
-            "direction": direction_name,
-            "frameCount": frame_count,
-        },
         "frames": frames_meta,
+        "meta": {
+            "app": "BlenderSprite",
+            "image": os.path.basename(sheet_png),
+            "format": "RGBA8888",
+            "size": {"w": sheet_w, "h": sheet_h},
+            "scale": "1",
+        },
     }
     try:
         with open(sheet_json, "w", encoding="utf-8") as f:
@@ -188,10 +214,10 @@ def _pack_folder(np, spritesheet_root, action_name, layer_name, direction_name, 
     return True
 
 
-def _run_pack(export_root, spritesheet_root):
+def _run_pack(export_root, spritesheet_root, split_by_action, split_by_layer,
+              row_split_by_action, row_split_by_layer, row_split_by_direction):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors)."""
     import numpy as np
-    from collections import defaultdict
 
     if not os.path.isdir(export_root):
         _log(f"  WARNING: export root not found: {export_root}")
@@ -199,37 +225,48 @@ def _run_pack(export_root, spritesheet_root):
 
     os.makedirs(spritesheet_root, exist_ok=True)
     generated = 0
-    skipped = 0
     errors = 0
 
-    # Group flat PNGs by their action_layer_direction prefix.
-    # Filename format: {action}_{layer}_{direction}_{frame:04d}.png
-    groups = defaultdict(list)
+    # Parse all flat PNGs: {action}--{layer}--{direction}--{frame:04d}.png
+    all_frames = []
     for fname in os.listdir(export_root):
         if not fname.lower().endswith(".png"):
             continue
-        stem = fname[:-4]  # strip .png
-        parts = stem.rsplit("_", 1)
-        if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 4:
-            groups[parts[0]].append(os.path.join(export_root, fname))
-
-    for key in sorted(groups):
-        # key is "{action}_{layer}_{direction}"
-        # action = first token (starts with "chr_"), direction = last token, layer = middle
-        parts = key.split("_")
-        if len(parts) < 3:
-            _log(f"  WARNING: unexpected filename prefix '{key}', skipping.")
-            skipped += 1
+        stem = fname[:-4]
+        parts = stem.split("--")
+        if len(parts) != 4 or not parts[3].isdigit():
             continue
-        action_name = parts[0]
-        direction_name = parts[-1]
-        layer_name = "_".join(parts[1:-1])
-        if _pack_folder(np, spritesheet_root, action_name, layer_name, direction_name, groups[key]):
+        all_frames.append({
+            "filepath": os.path.join(export_root, fname),
+            "action": parts[0],
+            "layer": parts[1],
+            "direction": parts[2],
+            "frame_num": int(parts[3]),
+        })
+
+    if not all_frames:
+        _log("  WARNING: No frames found to pack.")
+        return 0, 0, 0
+
+    # Group frames into sheets based on split settings
+    sheets = {}
+    for f in all_frames:
+        key_parts = []
+        if split_by_action:
+            key_parts.append(f["action"])
+        if split_by_layer:
+            key_parts.append(f["layer"])
+        sheet_name = "--".join(key_parts) if key_parts else "spritesheet"
+        sheets.setdefault(sheet_name, []).append(f)
+
+    for sheet_name, frames in sorted(sheets.items()):
+        if _pack_sheet(np, spritesheet_root, sheet_name, frames,
+                       row_split_by_action, row_split_by_layer, row_split_by_direction):
             generated += 1
         else:
             errors += 1
 
-    return generated, skipped, errors
+    return generated, 0, errors
 
 
 
@@ -322,16 +359,16 @@ def _build_job_queue(context, export_root):
         os.makedirs(export_root, exist_ok=True)
         for vl in view_layers:
             for direction_name, angle_radians in directions:
-                prefix = f"{action.name}_{vl.name}_{direction_name}"
+                prefix = f"{action.name}--{vl.name}--{direction_name}--"
                 if not overwrite and _count_existing_frames(export_root, action.name, vl.name, direction_name) >= expected_frames:
-                    _log(f"  SKIP  {prefix} ({expected_frames} frames exist)")
+                    _log(f"  SKIP  {action.name}/{vl.name}/{direction_name} ({expected_frames} frames exist)")
                     skipped += 1
                     continue
                 if overwrite:
                     for f in os.listdir(export_root):
-                        if f.startswith(prefix + "_") and f.lower().endswith(".png"):
+                        if f.startswith(prefix) and f.lower().endswith(".png"):
                             os.remove(os.path.join(export_root, f))
-                    _log(f"  CLEAR {prefix}")
+                    _log(f"  CLEAR {action.name}/{vl.name}/{direction_name}")
                 action_has_jobs = True
                 for frame in frames:
                     action_jobs.append({
@@ -340,7 +377,7 @@ def _build_job_queue(context, export_root):
                         "vl_name": vl.name,
                         "direction_name": direction_name,
                         "angle_radians": angle_radians,
-                        "out_path": os.path.join(export_root, f"{prefix}_{frame:04d}.png"),
+                        "out_path": os.path.join(export_root, _frame_filename(action.name, vl.name, direction_name, frame)),
                         "frame": frame,
                         "frame_start": frame_start,
                         "frame_end": frame_end,
@@ -409,6 +446,31 @@ class BlenderSpriteSettings(bpy.types.PropertyGroup):
         name="Overwrite Existing Frames",
         description="Re-render and overwrite frames that already exist on disk (instead of skipping them)",
         default=False,
+    )
+    split_by_action: bpy.props.BoolProperty(  # type: ignore
+        name="Split by Action",
+        description="Generate a separate sprite sheet per action",
+        default=True,
+    )
+    split_by_layer: bpy.props.BoolProperty(  # type: ignore
+        name="Split by Layer",
+        description="Generate a separate sprite sheet per view layer",
+        default=True,
+    )
+    row_split_by_action: bpy.props.BoolProperty(  # type: ignore
+        name="Action",
+        description="Each action gets its own row",
+        default=False,
+    )
+    row_split_by_layer: bpy.props.BoolProperty(  # type: ignore
+        name="Layer",
+        description="Each view layer gets its own row",
+        default=False,
+    )
+    row_split_by_direction: bpy.props.BoolProperty(  # type: ignore
+        name="Direction",
+        description="Each direction gets its own row",
+        default=True,
     )
     progress: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})  # type: ignore
     progress_factor: bpy.props.FloatProperty(default=0.0, options={'SKIP_SAVE'})  # type: ignore
@@ -616,7 +678,12 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
         _log(f"\n=== Render complete — rendered {self._rendered}, skipped {self._skipped}, errors {self._errors} ===")
         _log("=== BlenderSprite: Packing sprites ===")
 
-        packed, pack_skipped, pack_errors = _run_pack(self._export_root, self._spritesheet_root)
+        settings = context.scene.blendersprite
+        packed, pack_skipped, pack_errors = _run_pack(
+            self._export_root, self._spritesheet_root,
+            settings.split_by_action, settings.split_by_layer,
+            settings.row_split_by_action, settings.row_split_by_layer, settings.row_split_by_direction,
+        )
 
         _log(f"=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
 
@@ -659,6 +726,19 @@ class BLENDERSPRITE_PT_Main(bpy.types.Panel):
         layout.prop(settings, "view_layers_filter")
         layout.prop(settings, "export_root")
         layout.prop(settings, "spritesheet_root")
+        row = layout.row()
+        row.prop(settings, "split_by_action")
+        row.prop(settings, "split_by_layer")
+
+        layout.label(text="Row splits:")
+        row = layout.row()
+        sub = row.row()
+        sub.enabled = not settings.split_by_action
+        sub.prop(settings, "row_split_by_action")
+        sub = row.row()
+        sub.enabled = not settings.split_by_layer
+        sub.prop(settings, "row_split_by_layer")
+        row.prop(settings, "row_split_by_direction")
 
         # --- Validation warnings ---
         issues = []

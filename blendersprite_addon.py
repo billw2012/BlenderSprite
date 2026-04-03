@@ -95,10 +95,11 @@ def _resolve_path(prop_value, blend_relative_default):
     return ""
 
 
-def _count_existing_frames(folder, expected_count):
-    if not os.path.isdir(folder):
+def _count_existing_frames(export_root, action_name, layer_name, direction_name):
+    if not os.path.isdir(export_root):
         return 0
-    return len([f for f in os.listdir(folder) if f.lower().endswith(".png")])
+    prefix = f"{action_name}_{layer_name}_{direction_name}_"
+    return len([f for f in os.listdir(export_root) if f.startswith(prefix) and f.lower().endswith(".png")])
 
 
 def _numeric_sort_key(filename):
@@ -106,19 +107,16 @@ def _numeric_sort_key(filename):
     return int(numbers[0]) if numbers else 0
 
 
-def _pack_folder(np, spritesheet_root, action_name, layer_name, direction_name, folder_path):
-    """Pack PNGs in folder_path into a sprite sheet using bpy. Returns True on success."""
+def _pack_folder(np, spritesheet_root, action_name, layer_name, direction_name, filepaths):
+    """Pack a list of PNG filepaths into a sprite sheet using bpy. Returns True on success."""
     import json
 
-    png_files = sorted(
-        [f for f in os.listdir(folder_path) if f.lower().endswith(".png")],
-        key=_numeric_sort_key,
-    )
-    if not png_files:
-        _log(f"  WARNING: No PNG frames in {folder_path} — skipping.")
+    filepaths = sorted(filepaths, key=lambda p: _numeric_sort_key(os.path.basename(p)))
+    if not filepaths:
+        _log(f"  WARNING: No PNG frames for {action_name}_{layer_name}_{direction_name} — skipping.")
         return False
 
-    frame_count = len(png_files)
+    frame_count = len(filepaths)
     sheet_name = f"{action_name}_{layer_name}_{direction_name}"
     sheet_png = os.path.join(spritesheet_root, f"{sheet_name}.png")
     sheet_json = os.path.join(spritesheet_root, f"{sheet_name}.json")
@@ -128,8 +126,8 @@ def _pack_folder(np, spritesheet_root, action_name, layer_name, direction_name, 
     sheet_arr = np.zeros((FRAME_HEIGHT, FRAME_WIDTH * frame_count, 4), dtype=np.float32)
     frames_meta = []
 
-    for i, filename in enumerate(png_files):
-        filepath = os.path.join(folder_path, filename)
+    for i, filepath in enumerate(filepaths):
+        filename = os.path.basename(filepath)
         try:
             img = bpy.data.images.load(filepath)
         except Exception as exc:
@@ -193,30 +191,43 @@ def _pack_folder(np, spritesheet_root, action_name, layer_name, direction_name, 
 def _run_pack(export_root, spritesheet_root):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors)."""
     import numpy as np
+    from collections import defaultdict
+
+    if not os.path.isdir(export_root):
+        _log(f"  WARNING: export root not found: {export_root}")
+        return 0, 0, 0
 
     os.makedirs(spritesheet_root, exist_ok=True)
     generated = 0
     skipped = 0
     errors = 0
 
-    os.makedirs(export_root, exist_ok=True)
-
-    for action_name in sorted(os.listdir(export_root)):
-        action_path = os.path.join(export_root, action_name)
-        if not os.path.isdir(action_path):
+    # Group flat PNGs by their action_layer_direction prefix.
+    # Filename format: {action}_{layer}_{direction}_{frame:04d}.png
+    groups = defaultdict(list)
+    for fname in os.listdir(export_root):
+        if not fname.lower().endswith(".png"):
             continue
-        for layer_name in sorted(os.listdir(action_path)):
-            layer_path = os.path.join(action_path, layer_name)
-            if not os.path.isdir(layer_path):
-                continue
-            for direction_name in sorted(os.listdir(layer_path)):
-                dir_path = os.path.join(layer_path, direction_name)
-                if not os.path.isdir(dir_path):
-                    continue
-                if _pack_folder(np, spritesheet_root, action_name, layer_name, direction_name, dir_path):
-                    generated += 1
-                else:
-                    skipped += 1
+        stem = fname[:-4]  # strip .png
+        parts = stem.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 4:
+            groups[parts[0]].append(os.path.join(export_root, fname))
+
+    for key in sorted(groups):
+        # key is "{action}_{layer}_{direction}"
+        # action = first token (starts with "chr_"), direction = last token, layer = middle
+        parts = key.split("_")
+        if len(parts) < 3:
+            _log(f"  WARNING: unexpected filename prefix '{key}', skipping.")
+            skipped += 1
+            continue
+        action_name = parts[0]
+        direction_name = parts[-1]
+        layer_name = "_".join(parts[1:-1])
+        if _pack_folder(np, spritesheet_root, action_name, layer_name, direction_name, groups[key]):
+            generated += 1
+        else:
+            errors += 1
 
     return generated, skipped, errors
 
@@ -308,19 +319,19 @@ def _build_job_queue(context, export_root):
         expected_frames = len(frames)
         action_has_jobs = False
         action_jobs = []
+        os.makedirs(export_root, exist_ok=True)
         for vl in view_layers:
             for direction_name, angle_radians in directions:
-                out_folder = os.path.join(export_root, action.name, vl.name, direction_name)
-                if not overwrite and _count_existing_frames(out_folder, expected_frames) >= expected_frames:
-                    _log(f"  SKIP  {action.name}/{vl.name}/{direction_name} ({expected_frames} frames exist)")
+                prefix = f"{action.name}_{vl.name}_{direction_name}"
+                if not overwrite and _count_existing_frames(export_root, action.name, vl.name, direction_name) >= expected_frames:
+                    _log(f"  SKIP  {prefix} ({expected_frames} frames exist)")
                     skipped += 1
                     continue
-                if overwrite and os.path.isdir(out_folder):
-                    for f in os.listdir(out_folder):
-                        if f.lower().endswith(".png"):
-                            os.remove(os.path.join(out_folder, f))
-                    _log(f"  CLEAR {action.name}/{vl.name}/{direction_name}")
-                os.makedirs(out_folder, exist_ok=True)
+                if overwrite:
+                    for f in os.listdir(export_root):
+                        if f.startswith(prefix + "_") and f.lower().endswith(".png"):
+                            os.remove(os.path.join(export_root, f))
+                    _log(f"  CLEAR {prefix}")
                 action_has_jobs = True
                 for frame in frames:
                     action_jobs.append({
@@ -329,7 +340,7 @@ def _build_job_queue(context, export_root):
                         "vl_name": vl.name,
                         "direction_name": direction_name,
                         "angle_radians": angle_radians,
-                        "out_folder": out_folder,
+                        "out_path": os.path.join(export_root, f"{prefix}_{frame:04d}.png"),
                         "frame": frame,
                         "frame_start": frame_start,
                         "frame_end": frame_end,
@@ -499,6 +510,9 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
             for area in context.screen.areas:
                 area.tag_redraw()
             _log(f"=== Baking cloth for '{action.name}' ===")
+            armature_obj = settings.armature
+            if armature_obj and armature_obj.animation_data:
+                armature_obj.animation_data.action = action
             _bake_cloth_for_action(context, job["view_layers"], action, settings.cloth_warmup_frames)
             _log(f"=== Cloth bake done ===")
             self._job_index += 1
@@ -524,24 +538,48 @@ class BLENDERSPRITE_OT_RenderAll(bpy.types.Operator):
             armature_obj.animation_data_create()
         armature_obj.animation_data.action = action
 
-        vl = scene.view_layers.get(job["vl_name"])
-        if vl:
-            context.window.view_layer = vl
-
         camera_rig.rotation_euler.z = job["angle_radians"]
         scene.frame_set(frame)
-        out_path = os.path.join(job["out_folder"], f"{frame:04d}.png")
+        out_path = job["out_path"]
+
+        _log(
+            f"  RENDER  action={action.name}  layer={job['vl_name']}  "
+            f"dir={job['direction_name']}  frame={frame}  "
+            f"cam_z={camera_rig.rotation_euler.z:.3f}"
+        )
+
+        fmt = scene.render.image_settings
+        orig_filepath = scene.render.filepath
+        orig_media_type = fmt.media_type
+        orig_file_format = fmt.file_format
+
+        # Point all R_LAYERS compositor nodes at the target view layer
+        nt = scene.compositing_node_group
+        rl_orig = {}
+        if nt:
+            for node in nt.nodes:
+                if node.type == 'R_LAYERS':
+                    rl_orig[node.name] = node.layer
+                    node.layer = job["vl_name"]
 
         try:
-            bpy.ops.render.render(write_still=False)
-            result = bpy.data.images.get("Render Result")
-            if result is None:
-                raise RuntimeError("No render result found after rendering")
-            result.save_render(out_path)
+            scene.render.filepath = out_path
+            fmt.media_type = "IMAGE"
+            fmt.file_format = "PNG"
+            bpy.ops.render.render("EXEC_DEFAULT", write_still=True, layer=job["vl_name"])
+            _log(f"    OK  saved={out_path}")
             self._rendered += 1
         except Exception as exc:
             _log(f"    ERROR {label} frame {frame}: {exc}")
             self._errors += 1
+        finally:
+            scene.render.filepath = orig_filepath
+            fmt.media_type = orig_media_type
+            fmt.file_format = orig_file_format
+            if nt:
+                for node in nt.nodes:
+                    if node.type == 'R_LAYERS' and node.name in rl_orig:
+                        node.layer = rl_orig[node.name]
 
         self._job_index += 1
         return {"RUNNING_MODAL"}
@@ -695,16 +733,26 @@ def _set_default_armature(_):
                 settings.camera_rig = cam.parent
 
 
+def _purge_render_handlers():
+    """Remove any leftover BlenderSprite render handlers (e.g. from a failed previous run)."""
+    for handler_list in (bpy.app.handlers.render_complete, bpy.app.handlers.render_cancel):
+        for h in list(handler_list):
+            if getattr(h, "__qualname__", "").startswith("BLENDERSPRITE_OT_RenderAll"):
+                handler_list.remove(h)
+
+
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.blendersprite = bpy.props.PointerProperty(type=BlenderSpriteSettings)
     bpy.app.handlers.load_post.append(_set_default_armature)
+    _purge_render_handlers()
     # Also apply to any scenes already open
     _set_default_armature(None)
 
 
 def unregister():
+    _purge_render_handlers()
     bpy.app.handlers.load_post.remove(_set_default_armature)
     del bpy.types.Scene.blendersprite
     for cls in reversed(_classes):

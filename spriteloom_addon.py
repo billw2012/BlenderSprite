@@ -138,11 +138,14 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     sheet_arr = np.zeros((sheet_h, sheet_w, 4), dtype=np.float32)
     frames_meta = {}
 
-    # Build a flat index → frame_num map for renumbering
-    all_frames_sorted = []
-    for key in rows_ordered:
-        all_frames_sorted.extend(rows_map[key])
-    frame_index_map = {id(f): i for i, f in enumerate(all_frames_sorted)}
+    # Build per-(action, layer, direction) 0-based consecutive index map for renumbering
+    frame_index_map = {}
+    groups = {}
+    for f in frames:
+        groups.setdefault((f["action"], f["layer"], f["direction"]), []).append(f)
+    for group_frames in groups.values():
+        for i, f in enumerate(sorted(group_frames, key=lambda x: x["frame_num"])):
+            frame_index_map[id(f)] = i
 
     for row_idx, key in enumerate(rows_ordered):
         y_px = row_idx * FRAME_HEIGHT
@@ -168,7 +171,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             display_num = frame_index_map[id(f)] if renumber_frames else f["frame_num"]
             sprite_name = f"{f['action']}_{f['layer']}_{f['direction']}_{display_num:0{frame_num_padding}d}"
             frames_meta[sprite_name] = {
-                "frame": {"x": x_px, "y": y_px, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
+                "frame": {"x": x_px, "y": sheet_h - y_px - FRAME_HEIGHT, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
                 "rotated": False,
                 "trimmed": False,
                 "spriteSourceSize": {"x": 0, "y": 0, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},

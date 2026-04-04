@@ -681,6 +681,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         orig_filepath = scene.render.filepath
         orig_media_type = fmt.media_type
         orig_file_format = fmt.file_format
+        orig_color_mode = fmt.color_mode
 
         # Point all R_LAYERS compositor nodes at the target view layer
         nt = scene.compositing_node_group
@@ -695,6 +696,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             scene.render.filepath = out_path
             fmt.media_type = "IMAGE"
             fmt.file_format = "PNG"
+            fmt.color_mode = "RGBA"
             bpy.ops.render.render("EXEC_DEFAULT", write_still=True, layer=job["vl_name"])
             _log(f"    OK  saved={out_path}")
             self._rendered += 1
@@ -705,6 +707,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             scene.render.filepath = orig_filepath
             fmt.media_type = orig_media_type
             fmt.file_format = orig_file_format
+            fmt.color_mode = orig_color_mode
             if nt:
                 for node in nt.nodes:
                     if node.type == 'R_LAYERS' and node.name in rl_orig:

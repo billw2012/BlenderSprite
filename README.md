@@ -1,88 +1,120 @@
-# BlenderSprite
+# SpriteLoom
 
 Blender addon for rendering modular 2D character sprite sheets across all actions, clothing layers, and directions, ready for import into Unreal Engine.
 
+![SpriteLoom UI](screenshots/main-ui.png)
+
 ## Features
 
-- Renders all `chr_` prefixed actions automatically
-- Iterates all view layers (or a filtered subset) and 8 directions
-- Packs rendered frames into horizontal sprite sheets with JSON metadata
-- Resume support — skips folders that already have the expected frame count
+- Renders all actions matching a configurable prefix (default `chr_`)
+- Looping animation support — actions ending with a configurable tag (default `_loop`) exclude the duplicate last frame
+- Per-action clickable list shows frame count and jumps to the Animation workspace
+- View layer selection via checkboxes (one per layer, all enabled by default)
+- 1 / 4 / 8 / 16 direction rendering via camera rig rotation
+- Configurable file and row splits: separate sheets per action, layer, and/or direction
+- Configurable sheet naming via placeholders: `{blendfile}`, `{action}`, `{layer}`, `{direction}`
+- Live example output preview in the Sheet Layout panel
+- Cloth simulation baking per view layer / action combination before rendering
+- Resume support — skips frames that already exist on disk
+- Auto-detects armature and camera rig from the scene
 - N-panel UI with validation warnings and per-run summary
 
 ## Requirements
 
-- Blender 3.0+
+- Blender 4.2+
 - numpy (bundled with Blender)
 
 ## Installation
 
-1. In Blender: **Edit > Preferences > Add-ons > Install...**
-2. Select `blendersprite_addon.py`
-3. Enable the addon
-4. Open the **3D Viewport**, press **N**, select the **BlenderSprite** tab
+1. Build the zip: `python build_extension.py`
+2. In Blender: **Edit > Preferences > Extensions > Install from Disk...**
+3. Select `spriteloom.zip`
+4. Open the **3D Viewport**, press **N**, select the **SpriteLoom** tab
 
 ## Scene Setup
 
 ### Armature
-Actions must be named with the prefix `chr_`, e.g. `chr_walk`, `chr_run`, `chr_idle`.
+The addon auto-detects a single armature in the scene, or falls back to common names (`rig`, `armature`, `metarig`). You can override it in the panel.
 
 ### Camera Rig
-Parent your camera to an Empty. The addon will auto-detect it. Rotating this Empty changes the render direction.
+Parent your scene camera to an Empty. The addon auto-detects it and rotates it to render each direction.
+
+### Actions
+Name actions with a common prefix (default `chr_`), e.g. `chr_walk`, `chr_run`, `chr_idle`. For looping animations that should not repeat the last frame, add the loop tag suffix (default `_loop`), e.g. `chr_walk_loop`.
 
 ### View Layers
-One view layer per clothing layer. The addon renders all view layers by default, or a comma-separated subset if specified in the panel.
+Use one view layer per clothing/equipment layer. All layers are rendered by default; deselect individual layers in the panel to exclude them.
 
-## Usage
+## Panel Reference
 
-Configure the panel fields, then click **Render All**:
-
+### Scene Setup
 | Field | Description |
 |---|---|
-| Armature | Armature to read actions from (defaults to `rig`) |
-| Camera Rig | Empty to rotate for direction changes (auto-detected from camera parent) |
-| View Layers | Comma-separated layer names, or blank for all |
-| Export Root | Rendered frames output folder (defaults to `<blend dir>/export`) |
-| Spritesheet Root | Packed sheets output folder (defaults to `<blend dir>/spritesheets`) |
+| Armature | Armature to read actions from |
+| Camera Rig | Empty to rotate for direction changes |
 
-## Output Structure
+### Render
+| Field | Description |
+|---|---|
+| Directions | Number of render directions: 1 / 4 / 8 / 16 |
+| Frame Step | Render every Nth frame |
+| Action Prefix | Only actions starting with this prefix are rendered |
+| Action Loop Tag | Actions ending with this suffix exclude the last frame |
+| Bake Cloth | Bake cloth simulations before rendering (per layer/action) |
+| Warmup Frames | Extra frames baked before the action start |
 
+### Output
+| Field | Description |
+|---|---|
+| View Layers | Checkboxes to include/exclude individual layers |
+| Export Root | Folder for rendered frames (supports `//` blend-relative paths) |
+| Spritesheet Root | Folder for packed sprite sheets |
+
+### Sheet Layout
+| Field | Description |
+|---|---|
+| File splits | Separate files per Action / Layer / Direction |
+| Row splits | Separate rows per Action / Layer / Direction within a sheet |
+| Name Format | Filename template using `{blendfile}`, `{action}`, `{layer}`, `{direction}` |
+
+## Output
+
+Rendered frames are written flat into the export folder:
 ```
 export/
-  chr_walk/
-    LayerName/
-      north/  northeast/  east/ ...
-        0001.png  0002.png ...
+  {action}--{layer}--{direction}--{frame:04d}.png
+```
 
+Packed sprite sheets:
+```
 spritesheets/
-  chr_walk_LayerName_north.png
-  chr_walk_LayerName_north.json
-  ...
+  {name}.png
+  {name}.json
+```
+
+## JSON Format
+
+Sprite sheet metadata compatible with TexturePacker / Aseprite:
+
+```json
+{
+  "meta": {
+    "image": "myfile-Coat-chr_walk-south.png",
+    "size": { "w": 512, "h": 64 },
+    "frameSize": { "w": 64, "h": 64 },
+    "action": "chr_walk",
+    "layer": "Coat",
+    "direction": "south",
+    "frameCount": 8
+  },
+  "frames": [
+    { "filename": "myfile-Coat-chr_walk-south_0", "frame": { "x": 0, "y": 0, "w": 64, "h": 64 }, "duration": 100 }
+  ]
+}
 ```
 
 ## CLI Usage
 
 ```
-blender --background myfile.blend --python blender_render.py
-```
-
-## JSON Format
-
-Sprite sheet metadata is compatible with TexturePacker / Aseprite export format:
-
-```json
-{
-  "meta": {
-    "image": "chr_walk_LayerName_north.png",
-    "size": { "w": 512, "h": 64 },
-    "frameSize": { "w": 64, "h": 64 },
-    "action": "chr_walk",
-    "layer": "LayerName",
-    "direction": "north",
-    "frameCount": 8
-  },
-  "frames": [
-    { "filename": "chr_walk_LayerName_north_0", "frame": { "x": 0, "y": 0, "w": 64, "h": 64 }, "duration": 100 }
-  ]
-}
+blender --background myfile.blend --python spriteloom_render.py
 ```

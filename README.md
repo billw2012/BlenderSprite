@@ -43,7 +43,19 @@ Parent your scene camera to an Empty. The addon auto-detects it and rotates it t
 Name actions with a common prefix (default `chr_`), e.g. `chr_walk`, `chr_run`, `chr_idle`. For looping animations that should not repeat the last frame, add the loop tag suffix (default `_loop`), e.g. `chr_walk_loop`.
 
 ### View Layers
-Use one view layer per clothing/equipment layer. All layers are rendered by default; deselect individual layers in the panel to exclude them.
+Use one view layer per clothing/equipment layer (e.g. `Guy` for the base body, `Coat` for an overcoat). Within each view layer, configure object visibility and holdout to control exactly what appears in that render pass:
+
+- **Visible**: objects that should appear in this layer's output (e.g. the body and the coat in the `Coat` layer)
+- **Holdout**: objects that should punch a hole through everything behind them (e.g. the body in the `Coat` layer, so the coat is correctly masked against the character silhouette rather than the background)
+
+This lets each layer produce a correctly composited RGBA image that can be layered in-engine.
+
+All view layers are rendered by default; deselect individual layers in the panel to exclude them.
+
+### Compositor
+SpriteLoom renders via Blender's compositor. Set up the compositor with a **Render Layers** (View Layer) input node connected to your output. SpriteLoom automatically updates the View Layer input to the current layer before each render, so a single compositor graph handles all layers correctly without any manual switching.
+
+The simplest setup: **Render Layers → Composite**. Any colour correction, alpha-over, or other nodes between them will be applied consistently to every layer and direction.
 
 ## Panel Reference
 

@@ -64,14 +64,10 @@ def _log(msg):
 
 
 def _resolve_view_layers(scene, filter_str):
-    """Return view layer objects to render. Uses all scene layers if filter_str is empty."""
+    """Return view layer objects to render. filter_str is a CSV of EXCLUDED layers; empty = all included."""
     if filter_str.strip():
-        names = [n.strip() for n in filter_str.split(",") if n.strip()]
-        layers = [scene.view_layers.get(n) for n in names]
-        missing = [n for n, vl in zip(names, layers) if vl is None]
-        if missing:
-            _log(f"WARNING: View layers not found and will be skipped: {', '.join(missing)}")
-        return [vl for vl in layers if vl is not None]
+        excluded = {n.strip() for n in filter_str.split(",") if n.strip()}
+        return [vl for vl in scene.view_layers if vl.name not in excluded]
     return list(scene.view_layers)
 
 
@@ -204,7 +200,21 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     return True
 
 
-def _run_pack(export_root, spritesheet_root, split_by_action, split_by_layer,
+def _format_sheet_name(fmt, blendfile="", action="", layer="", direction=""):
+    """Substitute placeholders and clean up empty segments."""
+    import re
+    name = fmt
+    name = name.replace("{blendfile}", blendfile)
+    name = name.replace("{action}", action)
+    name = name.replace("{layer}", layer)
+    name = name.replace("{direction}", direction)
+    name = re.sub(r'[-_\s]{2,}', lambda m: m.group(0)[0], name)
+    name = name.strip("-_ ")
+    return name or "spritesheet"
+
+
+def _run_pack(export_root, spritesheet_root, sheet_name_format,
+              split_by_action, split_by_layer, split_by_direction,
               row_split_by_action, row_split_by_layer, row_split_by_direction):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors)."""
     import numpy as np
@@ -216,6 +226,8 @@ def _run_pack(export_root, spritesheet_root, split_by_action, split_by_layer,
     os.makedirs(spritesheet_root, exist_ok=True)
     generated = 0
     errors = 0
+
+    blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
 
     # Parse all flat PNGs: {action}--{layer}--{direction}--{frame:04d}.png
     all_frames = []
@@ -241,15 +253,21 @@ def _run_pack(export_root, spritesheet_root, split_by_action, split_by_layer,
     # Group frames into sheets based on split settings
     sheets = {}
     for f in all_frames:
-        key_parts = []
-        if split_by_action:
-            key_parts.append(f["action"])
-        if split_by_layer:
-            key_parts.append(f["layer"])
-        sheet_name = "--".join(key_parts) if key_parts else "spritesheet"
-        sheets.setdefault(sheet_name, []).append(f)
+        key = tuple([
+            f["action"] if split_by_action else "",
+            f["layer"] if split_by_layer else "",
+            f["direction"] if split_by_direction else "",
+        ])
+        sheets.setdefault(key, []).append(f)
 
-    for sheet_name, frames in sorted(sheets.items()):
+    for (action_key, layer_key, direction_key), frames in sorted(sheets.items()):
+        sheet_name = _format_sheet_name(
+            sheet_name_format,
+            blendfile=blendfile,
+            action=action_key,
+            layer=layer_key,
+            direction=direction_key,
+        )
         if _pack_sheet(np, spritesheet_root, sheet_name, frames,
                        row_split_by_action, row_split_by_layer, row_split_by_direction):
             generated += 1
@@ -437,6 +455,11 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         description="Re-render and overwrite frames that already exist on disk (instead of skipping them)",
         default=False,
     )
+    sheet_name_format: bpy.props.StringProperty(  # type: ignore
+        name="Name Format",
+        description="Filename format for sprite sheets. Placeholders: {blendfile} {action} {layer} {direction}",
+        default="{blendfile}-{layer}-{action}-{direction}",
+    )
     split_by_action: bpy.props.BoolProperty(  # type: ignore
         name="Action",
         description="Generate a separate sprite sheet per action",
@@ -446,6 +469,11 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         name="Layer",
         description="Generate a separate sprite sheet per view layer",
         default=True,
+    )
+    split_by_direction: bpy.props.BoolProperty(  # type: ignore
+        name="Direction",
+        description="Generate a separate sprite sheet per direction",
+        default=False,
     )
     row_split_by_action: bpy.props.BoolProperty(  # type: ignore
         name="Action",
@@ -677,7 +705,8 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         settings = context.scene.spriteloom
         packed, pack_skipped, pack_errors = _run_pack(
             self._export_root, self._spritesheet_root,
-            settings.split_by_action, settings.split_by_layer,
+            settings.sheet_name_format,
+            settings.split_by_action, settings.split_by_layer, settings.split_by_direction,
             settings.row_split_by_action, settings.row_split_by_layer, settings.row_split_by_direction,
         )
 
@@ -743,10 +772,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         row.label(icon="FILE_FOLDER")
         if settings.show_output:
             box.label(text="View Layers:")
-            included = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()} if settings.view_layers_filter else None
+            excluded = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()}
             grid = box.grid_flow(row_major=True, columns=2, align=True)
             for vl in scene.view_layers:
-                is_on = included is None or vl.name in included
+                is_on = vl.name not in excluded
                 op = grid.operator("spriteloom.toggle_view_layer",
                                    text=vl.name,
                                    icon='CHECKBOX_HLT' if is_on else 'CHECKBOX_DEHLT',
@@ -764,38 +793,51 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         if settings.show_sheet_layout:
             box.label(text="File splits:")
             row = box.row(align=True)
-            row.prop(settings, "split_by_action")
             row.prop(settings, "split_by_layer")
+            row.prop(settings, "split_by_action")
+            row.prop(settings, "split_by_direction")
 
             box.label(text="Row splits:")
             row = box.row(align=True)
             sub = row.row()
+            sub.enabled = not settings.split_by_layer
+            sub.prop(settings, "row_split_by_layer")
+            sub = row.row()
             sub.enabled = not settings.split_by_action
             sub.prop(settings, "row_split_by_action")
             sub = row.row()
-            sub.enabled = not settings.split_by_layer
-            sub.prop(settings, "row_split_by_layer")
-            row.prop(settings, "row_split_by_direction")
+            sub.enabled = not settings.split_by_direction
+            sub.prop(settings, "row_split_by_direction")
 
-            box.label(text="Example output:")
             box.separator(factor=0.5)
+            box.prop(settings, "sheet_name_format")
+            col = box.column(align=True)
+            col.scale_y = 0.7
+            col.label(text="{blendfile}  {action}  {layer}  {direction}", icon='INFO')
+
+            box.separator(factor=0.5)
+            box.label(text="Example output:")
+            blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
             example_actions = [a.name for a in bpy.data.actions if a.name.startswith("chr_")] or ["chr_walk", "chr_idle"]
             example_layers = [vl.name for vl in _resolve_view_layers(scene, settings.view_layers_filter)] or ["Layer"]
+            example_directions = [d[0] for d in _get_directions(settings.num_directions)]
             seen = []
             for action in example_actions:
                 for layer in example_layers:
-                    key_parts = []
-                    if settings.split_by_action:
-                        key_parts.append(action)
-                    if settings.split_by_layer:
-                        key_parts.append(layer)
-                    key = "--".join(key_parts) if key_parts else "spritesheet"
-                    if key not in seen:
-                        seen.append(key)
+                    for direction in (example_directions if settings.split_by_direction else [""]):
+                        name = _format_sheet_name(
+                            settings.sheet_name_format,
+                            blendfile=blendfile,
+                            action=action if settings.split_by_action else "",
+                            layer=layer if settings.split_by_layer else "",
+                            direction=direction if settings.split_by_direction else "",
+                        )
+                        if name not in seen:
+                            seen.append(name)
             col = box.column(align=True)
             col.scale_y = 0.75
-            for key in seen[:5]:
-                col.label(text=f"{key}.png", icon='FILE_IMAGE')
+            for name in seen[:5]:
+                col.label(text=f"{name}.png", icon='FILE_IMAGE')
             if len(seen) > 5:
                 col.label(text=f"+{len(seen) - 5} more…", icon='BLANK1')
 
@@ -858,18 +900,12 @@ class SPRITELOOM_OT_ToggleViewLayer(bpy.types.Operator):
     def execute(self, context):
         settings = context.scene.spriteloom
         all_layers = [vl.name for vl in context.scene.view_layers]
-        if not settings.view_layers_filter:
-            included = set(all_layers)
+        excluded = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()}
+        if self.layer_name in excluded:
+            excluded.discard(self.layer_name)
         else:
-            included = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()}
-        if self.layer_name in included:
-            included.discard(self.layer_name)
-        else:
-            included.add(self.layer_name)
-        if included == set(all_layers):
-            settings.view_layers_filter = ""
-        else:
-            settings.view_layers_filter = ", ".join(n for n in all_layers if n in included)
+            excluded.add(self.layer_name)
+        settings.view_layers_filter = ", ".join(n for n in all_layers if n in excluded)
         return {'FINISHED'}
 
 

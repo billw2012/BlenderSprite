@@ -355,8 +355,7 @@ def _build_job_queue(context, export_root):
     for action in chr_actions:
         frame_start = int(action.frame_range[0])
         frame_end = int(action.frame_range[1])
-        is_loop = bool(settings.loop_tag) and action.name.endswith(settings.loop_tag)
-        loop_end = frame_end if is_loop else frame_end + 1
+        loop_end = frame_end if action.use_cyclic else frame_end + 1
         frames = list(range(frame_start, loop_end, frame_step))
         expected_frames = len(frames)
         action_has_jobs = False
@@ -428,11 +427,6 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         name="Action Prefix",
         description="Only actions starting with this prefix will be rendered. Leave blank for all actions",
         default="chr_",
-    )
-    loop_tag: bpy.props.StringProperty(  # type: ignore
-        name="Action Loop Tag",
-        description="Actions ending with this suffix are treated as looping (last frame excluded)",
-        default="_loop",
     )
     frame_step: bpy.props.IntProperty(  # type: ignore
         name="Frame Step",
@@ -771,22 +765,19 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.prop(settings, "num_directions")
             box.prop(settings, "frame_step")
             box.prop(settings, "action_prefix", text="Action Prefix")
-            box.prop(settings, "loop_tag", text="Action Loop Tag")
             prefix = settings.action_prefix
-            loop_tag = settings.loop_tag
             detected = [a for a in bpy.data.actions if a.name.startswith(prefix)] if prefix else list(bpy.data.actions)
             if detected:
                 col = box.column(align=True)
                 col.scale_y = 0.75
                 for a in detected:
-                    is_loop = bool(loop_tag) and a.name.endswith(loop_tag)
                     frame_start = int(a.frame_range[0])
                     frame_end = int(a.frame_range[1])
-                    loop_end = frame_end if is_loop else frame_end + 1
+                    loop_end = frame_end if a.use_cyclic else frame_end + 1
                     frame_count = len(range(frame_start, loop_end, settings.frame_step))
                     op = col.operator("spriteloom.focus_action",
                                       text=f"{a.name}  ({frame_count} frames)",
-                                      icon='FILE_REFRESH' if is_loop else 'ACTION',
+                                      icon='FILE_REFRESH' if a.use_cyclic else 'ACTION',
                                       emboss=False)
                     op.action_name = a.name
             else:

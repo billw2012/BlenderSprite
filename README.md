@@ -7,7 +7,7 @@ Blender addon for rendering modular 2D character sprite sheets across all action
 ## Features
 
 - Renders all actions matching a configurable prefix (default `chr_`)
-- Looping animation support — actions ending with a configurable tag (default `_loop`) exclude the duplicate last frame
+- Looping animation support — actions with **Cyclic Animation** enabled exclude the duplicate last frame
 - Per-action clickable list shows frame count and jumps to the Animation workspace
 - View layer selection via checkboxes (one per layer, all enabled by default)
 - 1 / 4 / 8 / 16 direction rendering via camera rig rotation
@@ -40,7 +40,7 @@ The addon auto-detects a single armature in the scene, or falls back to common n
 Parent your scene camera to an Empty. The addon auto-detects it and rotates it to render each direction.
 
 ### Actions
-Name actions with a common prefix (default `chr_`), e.g. `chr_walk`, `chr_run`, `chr_idle`. For looping animations that should not repeat the last frame, add the loop tag suffix (default `_loop`), e.g. `chr_walk_loop`.
+Name actions with a common prefix (default `chr_`), e.g. `chr_walk`, `chr_run`, `chr_idle`. For looping animations that should not repeat the last frame, enable **Cyclic Animation** on the action in the Action Editor (Action menu > Cyclic Animation, or the checkbox in the Action properties). SpriteLoom will automatically detect this and exclude the duplicate last frame.
 
 ### View Layers
 Use one view layer per clothing/equipment layer (e.g. `Guy` for the base body, `Coat` for an overcoat). Within each view layer, configure object visibility and holdout to control exactly what appears in that render pass:
@@ -71,7 +71,6 @@ The simplest setup: **Render Layers → Composite**. Any colour correction, alph
 | Directions | Number of render directions: 1 / 4 / 8 / 16 |
 | Frame Step | Render every Nth frame |
 | Action Prefix | Only actions starting with this prefix are rendered |
-| Action Loop Tag | Actions ending with this suffix exclude the last frame |
 | Bake Cloth | Bake cloth simulations before rendering (per layer/action) |
 | Warmup Frames | Extra frames baked before the action start |
 

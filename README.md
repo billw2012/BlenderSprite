@@ -6,16 +6,19 @@ Blender addon for rendering modular 2D character sprite sheets across all action
 
 ## Features
 
-- Renders all actions matching a configurable prefix (default `chr_`)
+- All actions in the file shown as checkboxes, all selected by default — click to include/exclude
 - Looping animation support — actions with **Cyclic Animation** enabled exclude the duplicate last frame
-- Per-action clickable list shows frame count and jumps to the Animation workspace
+- Navigate buttons on each action (jump to Animation workspace) and view layer (activate it)
 - View layer selection via checkboxes (one per layer, all enabled by default)
 - 1 / 4 / 8 / 16 direction rendering via camera rig rotation
 - Configurable file and row splits: separate sheets per action, layer, and/or direction
 - Configurable sheet naming via placeholders: `{blendfile}`, `{action}`, `{layer}`, `{direction}`
+- Frame renumbering: JSON keys can be 0-based consecutive or original Blender frame numbers
+- Configurable frame number zero-padding (default 2 digits)
 - Live example output preview in the Sheet Layout panel
 - Cloth simulation baking per view layer / action combination before rendering
-- Resume support — skips frames that already exist on disk
+- Clean Before Render option to wipe the export folder before each run
+- Resume support — skips frames that already exist on disk (when clean is off)
 - Auto-detects armature and camera rig from the scene
 - N-panel UI with validation warnings and per-run summary
 
@@ -70,22 +73,26 @@ The simplest setup: **Render Layers → Composite**. Any colour correction, alph
 |---|---|
 | Directions | Number of render directions: 1 / 4 / 8 / 16 |
 | Frame Step | Render every Nth frame |
-| Action Prefix | Only actions starting with this prefix are rendered |
+| Actions | Checkbox list of all actions in the file — all selected by default; click to toggle, link button to navigate |
 | Bake Cloth | Bake cloth simulations before rendering (per layer/action) |
 | Warmup Frames | Extra frames baked before the action start |
 
 ### Output
 | Field | Description |
 |---|---|
-| View Layers | Checkboxes to include/exclude individual layers |
+| View Layers | Checkbox list of all view layers — all selected by default; click to toggle, link button to activate |
 | Export Root | Folder for rendered frames (supports `//` blend-relative paths) |
 | Spritesheet Root | Folder for packed sprite sheets |
+| Clean Before Render | Delete all files in the export folder before starting |
+| Overwrite Existing Frames | Re-render frames that already exist on disk |
 
 ### Sheet Layout
 | Field | Description |
 |---|---|
 | File splits | Separate files per Action / Layer / Direction |
 | Row splits | Separate rows per Action / Layer / Direction within a sheet |
+| Renumber Frames | JSON frame keys are 0-based consecutive (off = original Blender frame numbers) |
+| Frame Number Padding | Zero-pad width for frame number keys (default 2) |
 | Name Format | Filename template using `{blendfile}`, `{action}`, `{layer}`, `{direction}` |
 
 ## Output

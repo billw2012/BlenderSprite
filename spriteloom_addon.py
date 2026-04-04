@@ -331,9 +331,10 @@ def _build_job_queue(context, export_root):
     if camera_rig is None:
         return None, "No camera rig selected"
 
-    chr_actions = [a for a in bpy.data.actions if a.name.startswith("chr_")]
+    prefix = settings.action_prefix
+    chr_actions = [a for a in bpy.data.actions if a.name.startswith(prefix)] if prefix else list(bpy.data.actions)
     if not chr_actions:
-        return None, "No actions found with prefix 'chr_'"
+        return None, f"No actions found with prefix '{prefix}'"
 
     view_layers = _resolve_view_layers(scene, settings.view_layers_filter)
     if not view_layers:
@@ -354,7 +355,9 @@ def _build_job_queue(context, export_root):
     for action in chr_actions:
         frame_start = int(action.frame_range[0])
         frame_end = int(action.frame_range[1])
-        frames = list(range(frame_start, frame_end + 1, frame_step))
+        is_loop = bool(settings.loop_tag) and action.name.endswith(settings.loop_tag)
+        loop_end = frame_end if is_loop else frame_end + 1
+        frames = list(range(frame_start, loop_end, frame_step))
         expected_frames = len(frames)
         action_has_jobs = False
         action_jobs = []
@@ -420,6 +423,16 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
             ("16", "16 — Full",       ""),
         ],
         default="8",
+    )
+    action_prefix: bpy.props.StringProperty(  # type: ignore
+        name="Action Prefix",
+        description="Only actions starting with this prefix will be rendered. Leave blank for all actions",
+        default="chr_",
+    )
+    loop_tag: bpy.props.StringProperty(  # type: ignore
+        name="Action Loop Tag",
+        description="Actions ending with this suffix are treated as looping (last frame excluded)",
+        default="_loop",
     )
     frame_step: bpy.props.IntProperty(  # type: ignore
         name="Frame Step",
@@ -757,6 +770,27 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         if settings.show_render:
             box.prop(settings, "num_directions")
             box.prop(settings, "frame_step")
+            box.prop(settings, "action_prefix", text="Action Prefix")
+            box.prop(settings, "loop_tag", text="Action Loop Tag")
+            prefix = settings.action_prefix
+            loop_tag = settings.loop_tag
+            detected = [a for a in bpy.data.actions if a.name.startswith(prefix)] if prefix else list(bpy.data.actions)
+            if detected:
+                col = box.column(align=True)
+                col.scale_y = 0.75
+                for a in detected:
+                    is_loop = bool(loop_tag) and a.name.endswith(loop_tag)
+                    frame_start = int(a.frame_range[0])
+                    frame_end = int(a.frame_range[1])
+                    loop_end = frame_end if is_loop else frame_end + 1
+                    frame_count = len(range(frame_start, loop_end, settings.frame_step))
+                    op = col.operator("spriteloom.focus_action",
+                                      text=f"{a.name}  ({frame_count} frames)",
+                                      icon='FILE_REFRESH' if is_loop else 'ACTION',
+                                      emboss=False)
+                    op.action_name = a.name
+            else:
+                box.label(text=f"No actions with prefix '{prefix}'", icon='ERROR')
             row = box.row(align=True)
             row.prop(settings, "bake_cloth")
             if settings.bake_cloth:
@@ -815,7 +849,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.separator(factor=0.5)
             box.label(text="Example output:")
             blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
-            example_actions = [a.name for a in bpy.data.actions if a.name.startswith("chr_")] or ["chr_walk", "chr_idle"]
+            ex_prefix = settings.action_prefix
+            example_actions = ([a.name for a in bpy.data.actions if a.name.startswith(ex_prefix)] if ex_prefix else [a.name for a in bpy.data.actions]) or ["chr_walk", "chr_idle"]
             example_layers = [vl.name for vl in _resolve_view_layers(scene, settings.view_layers_filter)] or ["Layer"]
             example_directions = [d[0] for d in _get_directions(settings.num_directions)]
             seen = []
@@ -847,10 +882,11 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             issues.append(("ERROR", "No camera rig selected"))
             issues.append(("INFO", "Hint: parent your camera to an Empty"))
 
-        chr_actions = [a for a in bpy.data.actions if a.name.startswith("chr_")]
+        _prefix = settings.action_prefix
+        chr_actions = [a for a in bpy.data.actions if a.name.startswith(_prefix)] if _prefix else list(bpy.data.actions)
         if not chr_actions:
-            issues.append(("ERROR", "No actions found with prefix 'chr_'"))
-            issues.append(("INFO", "Hint: rename actions to e.g. chr_walk, chr_idle"))
+            issues.append(("ERROR", f"No actions found with prefix '{_prefix}'"))
+            issues.append(("INFO", f"Hint: rename actions to start with '{_prefix}'"))
 
         active_layers = _resolve_view_layers(scene, settings.view_layers_filter)
         if not active_layers:
@@ -887,6 +923,42 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
 # Registration
 # ---------------------------------------------------------------------------
 
+class SPRITELOOM_OT_FocusAction(bpy.types.Operator):
+    """Select the armature and set this action, then switch to the Animation workspace"""
+    bl_idname = "spriteloom.focus_action"
+    bl_label = "Focus Action"
+
+    action_name: bpy.props.StringProperty()  # type: ignore
+
+    def execute(self, context):
+        action = bpy.data.actions.get(self.action_name)
+        armature = context.scene.spriteloom.armature
+        if not action:
+            self.report({'WARNING'}, f"Action not found: {self.action_name}")
+            return {'CANCELLED'}
+        if not armature:
+            self.report({'WARNING'}, "No armature set")
+            return {'CANCELLED'}
+
+        # Select and activate the armature
+        for obj in context.scene.objects:
+            obj.select_set(False)
+        armature.select_set(True)
+        context.view_layer.objects.active = armature
+
+        # Assign the action
+        if not armature.animation_data:
+            armature.animation_data_create()
+        armature.animation_data.action = action
+
+        # Switch to Animation workspace if it exists
+        ws = bpy.data.workspaces.get("Animation")
+        if ws:
+            context.window.workspace = ws
+
+        return {'FINISHED'}
+
+
 class SPRITELOOM_OT_ToggleViewLayer(bpy.types.Operator):
     """Toggle a view layer on/off for rendering"""
     bl_idname = "spriteloom.toggle_view_layer"
@@ -909,6 +981,7 @@ class SPRITELOOM_OT_ToggleViewLayer(bpy.types.Operator):
 _classes = (
     SpriteLoomSettings,
     SPRITELOOM_OT_RenderAll,
+    SPRITELOOM_OT_FocusAction,
     SPRITELOOM_OT_ToggleViewLayer,
     SPRITELOOM_PT_Main,
 )

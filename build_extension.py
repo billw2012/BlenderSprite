@@ -1,8 +1,9 @@
-"""Build spriteloom.zip and hot-deploy to Blender's extension directory."""
+"""Build spriteloom-<version>.zip and hot-deploy to Blender's extension directory."""
 import zipfile
 import os
 import shutil
 import glob
+import re
 
 files = [
     "blender_manifest.toml",
@@ -11,8 +12,17 @@ files = [
     "spriteloom_render.py",
 ]
 
+# Read version from manifest
+version = "0.0.0"
+with open("blender_manifest.toml") as f:
+    for line in f:
+        m = re.match(r'^version\s*=\s*"([^"]+)"', line)
+        if m:
+            version = m.group(1)
+            break
+
 # Build zip
-output = "spriteloom.zip"
+output = f"spriteloom-{version}.zip"
 with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
     for f in files:
         zf.write(f)

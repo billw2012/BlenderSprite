@@ -24,14 +24,13 @@ Blender addon for rendering modular 2D character sprite sheets across all action
 
 ## Requirements
 
-- Blender 4.2+
-- numpy (bundled with Blender)
+- Blender 5+
 
 ## Installation
 
-1. Build the zip: `python build_extension.py`
+1. Download the latest `spriteloom-*.zip` from the [Releases](../../releases) page
 2. In Blender: **Edit > Preferences > Extensions > Install from Disk...**
-3. Select `spriteloom.zip`
+3. Select the downloaded zip
 4. Open the **3D Viewport**, press **N**, select the **SpriteLoom** tab
 
 ## Scene Setup
@@ -43,7 +42,7 @@ The addon auto-detects a single armature in the scene, or falls back to common n
 Parent your scene camera to an Empty. The addon auto-detects it and rotates it to render each direction.
 
 ### Actions
-Name actions with a common prefix (default `chr_`), e.g. `chr_walk`, `chr_run`, `chr_idle`. For looping animations that should not repeat the last frame, enable **Cyclic Animation** on the action in the Action Editor (Action menu > Cyclic Animation, or the checkbox in the Action properties). SpriteLoom will automatically detect this and exclude the duplicate last frame.
+All actions in the file are shown in the panel as a checkbox list, all selected by default. Uncheck any you don't want rendered. For looping animations that should not repeat the last frame, enable **Cyclic Animation** on the action in the Action Editor (Action menu > Cyclic Animation, or the checkbox in the Action properties). SpriteLoom will automatically detect this and exclude the duplicate last frame.
 
 ### View Layers
 Use one view layer per clothing/equipment layer (e.g. `Guy` for the base body, `Coat` for an overcoat). Within each view layer, configure object visibility and holdout to control exactly what appears in that render pass:
@@ -117,16 +116,16 @@ Sprite sheet metadata compatible with TexturePacker / Aseprite:
 ```json
 {
   "meta": {
-    "image": "myfile-Coat-chr_walk-south.png",
+    "image": "myfile-Coat-walk-south.png",
     "size": { "w": 512, "h": 64 },
     "frameSize": { "w": 64, "h": 64 },
-    "action": "chr_walk",
+    "action": "walk",
     "layer": "Coat",
     "direction": "south",
     "frameCount": 8
   },
   "frames": [
-    { "filename": "myfile-Coat-chr_walk-south_0", "frame": { "x": 0, "y": 0, "w": 64, "h": 64 }, "duration": 100 }
+    { "filename": "myfile-Coat-walk-south_00", "frame": { "x": 0, "y": 0, "w": 64, "h": 64 }, "duration": 100 }
   ]
 }
 ```

@@ -331,10 +331,10 @@ def _build_job_queue(context, export_root):
     if camera_rig is None:
         return None, "No camera rig selected"
 
-    prefix = settings.action_prefix
-    chr_actions = [a for a in bpy.data.actions if a.name.startswith(prefix)] if prefix else list(bpy.data.actions)
+    excluded_actions = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
+    chr_actions = [a for a in bpy.data.actions if a.name not in excluded_actions]
     if not chr_actions:
-        return None, f"No actions found with prefix '{prefix}'"
+        return None, "No actions to render (none in file or all excluded)"
 
     view_layers = _resolve_view_layers(scene, settings.view_layers_filter)
     if not view_layers:
@@ -423,10 +423,10 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         ],
         default="8",
     )
-    action_prefix: bpy.props.StringProperty(  # type: ignore
-        name="Action Prefix",
-        description="Only actions starting with this prefix will be rendered. Leave blank for all actions",
-        default="chr_",
+    actions_filter: bpy.props.StringProperty(  # type: ignore
+        name="Actions",
+        description="Comma-separated action names to EXCLUDE from rendering. Leave blank to render all",
+        default="",
     )
     frame_step: bpy.props.IntProperty(  # type: ignore
         name="Frame Step",
@@ -451,6 +451,11 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         default=20,
         min=0,
         max=500,
+    )
+    clean_output: bpy.props.BoolProperty(  # type: ignore
+        name="Clean Before Render",
+        description="Delete all files in the export directory before starting a new render",
+        default=False,
     )
     overwrite_frames: bpy.props.BoolProperty(  # type: ignore
         name="Overwrite Existing Frames",
@@ -548,6 +553,15 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         _log("=== SpriteLoom: Render All started ===")
         _log(f"Export root     : {self._export_root}")
         _log(f"Spritesheet root: {self._spritesheet_root}")
+
+        if settings.clean_output and os.path.isdir(self._export_root):
+            removed = 0
+            for fname in os.listdir(self._export_root):
+                fpath = os.path.join(self._export_root, fname)
+                if os.path.isfile(fpath):
+                    os.remove(fpath)
+                    removed += 1
+            _log(f"Clean: removed {removed} file(s) from {self._export_root}")
 
         jobs, result = _build_job_queue(context, self._export_root)
         if jobs is None:
@@ -764,24 +778,30 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         if settings.show_render:
             box.prop(settings, "num_directions")
             box.prop(settings, "frame_step")
-            box.prop(settings, "action_prefix", text="Action Prefix")
-            prefix = settings.action_prefix
-            detected = [a for a in bpy.data.actions if a.name.startswith(prefix)] if prefix else list(bpy.data.actions)
-            if detected:
-                col = box.column(align=True)
+            actions_box = box.box()
+            actions_box.label(text="Actions", icon="ACTION")
+            all_actions = list(bpy.data.actions)
+            if all_actions:
+                excluded_actions = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
+                col = actions_box.column(align=True)
                 col.scale_y = 0.75
-                for a in detected:
+                for a in all_actions:
                     frame_start = int(a.frame_range[0])
                     frame_end = int(a.frame_range[1])
                     loop_end = frame_end if a.use_cyclic else frame_end + 1
                     frame_count = len(range(frame_start, loop_end, settings.frame_step))
-                    op = col.operator("spriteloom.focus_action",
-                                      text=f"{a.name}  ({frame_count} frames)",
-                                      icon='FILE_REFRESH' if a.use_cyclic else 'ACTION',
+                    is_on = a.name not in excluded_actions
+                    loop_suffix = "  \u21ba" if a.use_cyclic else ""
+                    row = col.row(align=True)
+                    op = row.operator("spriteloom.toggle_action",
+                                      text=f"{a.name}  ({frame_count} frames){loop_suffix}",
+                                      icon='CHECKBOX_HLT' if is_on else 'CHECKBOX_DEHLT',
                                       emboss=False)
                     op.action_name = a.name
+                    nav = row.operator("spriteloom.focus_action", text="", icon='LINKED', emboss=False)
+                    nav.action_name = a.name
             else:
-                box.label(text=f"No actions with prefix '{prefix}'", icon='ERROR')
+                actions_box.label(text="No actions in file", icon='INFO')
             row = box.row(align=True)
             row.prop(settings, "bake_cloth")
             if settings.bake_cloth:
@@ -793,18 +813,24 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         row.prop(settings, "show_output", icon="TRIA_DOWN" if settings.show_output else "TRIA_RIGHT", emboss=False, text="Output", icon_only=False)
         row.label(icon="FILE_FOLDER")
         if settings.show_output:
-            box.label(text="View Layers:")
+            layers_box = box.box()
+            layers_box.label(text="View Layers", icon="RENDERLAYERS")
             excluded = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()}
-            grid = box.grid_flow(row_major=True, columns=2, align=True)
+            col = layers_box.column(align=True)
+            col.scale_y = 0.75
             for vl in scene.view_layers:
                 is_on = vl.name not in excluded
-                op = grid.operator("spriteloom.toggle_view_layer",
+                row = col.row(align=True)
+                op = row.operator("spriteloom.toggle_view_layer",
                                    text=vl.name,
                                    icon='CHECKBOX_HLT' if is_on else 'CHECKBOX_DEHLT',
                                    emboss=False)
                 op.layer_name = vl.name
+                act = row.operator("spriteloom.activate_view_layer", text="", icon='LINKED', emboss=False)
+                act.layer_name = vl.name
             box.prop(settings, "export_root")
             box.prop(settings, "spritesheet_root")
+            box.prop(settings, "clean_output")
             box.prop(settings, "overwrite_frames")
 
         # --- Sheet Layout ---
@@ -840,8 +866,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.separator(factor=0.5)
             box.label(text="Example output:")
             blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
-            ex_prefix = settings.action_prefix
-            example_actions = ([a.name for a in bpy.data.actions if a.name.startswith(ex_prefix)] if ex_prefix else [a.name for a in bpy.data.actions]) or ["chr_walk", "chr_idle"]
+            _ex_excluded = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
+            example_actions = [a.name for a in bpy.data.actions if a.name not in _ex_excluded] or ["chr_walk", "chr_idle"]
             example_layers = [vl.name for vl in _resolve_view_layers(scene, settings.view_layers_filter)] or ["Layer"]
             example_directions = [d[0] for d in _get_directions(settings.num_directions)]
             seen = []
@@ -873,11 +899,12 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             issues.append(("ERROR", "No camera rig selected"))
             issues.append(("INFO", "Hint: parent your camera to an Empty"))
 
-        _prefix = settings.action_prefix
-        chr_actions = [a for a in bpy.data.actions if a.name.startswith(_prefix)] if _prefix else list(bpy.data.actions)
+        _excluded = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
+        chr_actions = [a for a in bpy.data.actions if a.name not in _excluded]
         if not chr_actions:
-            issues.append(("ERROR", f"No actions found with prefix '{_prefix}'"))
-            issues.append(("INFO", f"Hint: rename actions to start with '{_prefix}'"))
+            issues.append(("ERROR", "No actions to render (none in file or all excluded)"))
+            if bpy.data.actions:
+                issues.append(("INFO", "Hint: uncheck at least one action above"))
 
         active_layers = _resolve_view_layers(scene, settings.view_layers_filter)
         if not active_layers:
@@ -915,7 +942,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
 # ---------------------------------------------------------------------------
 
 class SPRITELOOM_OT_FocusAction(bpy.types.Operator):
-    """Select the armature and set this action, then switch to the Animation workspace"""
+    """Set this action on the armature and switch to the Animation workspace"""
     bl_idname = "spriteloom.focus_action"
     bl_label = "Focus Action"
 
@@ -930,23 +957,51 @@ class SPRITELOOM_OT_FocusAction(bpy.types.Operator):
         if not armature:
             self.report({'WARNING'}, "No armature set")
             return {'CANCELLED'}
-
-        # Select and activate the armature
         for obj in context.scene.objects:
             obj.select_set(False)
         armature.select_set(True)
         context.view_layer.objects.active = armature
-
-        # Assign the action
         if not armature.animation_data:
             armature.animation_data_create()
         armature.animation_data.action = action
-
-        # Switch to Animation workspace if it exists
         ws = bpy.data.workspaces.get("Animation")
         if ws:
             context.window.workspace = ws
+        return {'FINISHED'}
 
+
+class SPRITELOOM_OT_ActivateViewLayer(bpy.types.Operator):
+    """Set this as the active view layer"""
+    bl_idname = "spriteloom.activate_view_layer"
+    bl_label = "Activate View Layer"
+
+    layer_name: bpy.props.StringProperty()  # type: ignore
+
+    def execute(self, context):
+        vl = context.scene.view_layers.get(self.layer_name)
+        if not vl:
+            self.report({'WARNING'}, f"View layer not found: {self.layer_name}")
+            return {'CANCELLED'}
+        context.window.view_layer = vl
+        return {'FINISHED'}
+
+
+class SPRITELOOM_OT_ToggleAction(bpy.types.Operator):
+    """Toggle an action on/off for rendering"""
+    bl_idname = "spriteloom.toggle_action"
+    bl_label = "Toggle Action"
+
+    action_name: bpy.props.StringProperty()  # type: ignore
+
+    def execute(self, context):
+        settings = context.scene.spriteloom
+        all_names = [a.name for a in bpy.data.actions]
+        excluded = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
+        if self.action_name in excluded:
+            excluded.discard(self.action_name)
+        else:
+            excluded.add(self.action_name)
+        settings.actions_filter = ", ".join(n for n in all_names if n in excluded)
         return {'FINISHED'}
 
 
@@ -973,6 +1028,8 @@ _classes = (
     SpriteLoomSettings,
     SPRITELOOM_OT_RenderAll,
     SPRITELOOM_OT_FocusAction,
+    SPRITELOOM_OT_ActivateViewLayer,
+    SPRITELOOM_OT_ToggleAction,
     SPRITELOOM_OT_ToggleViewLayer,
     SPRITELOOM_PT_Main,
 )

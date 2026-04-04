@@ -102,7 +102,8 @@ def _row_key(f, row_split_by_action, row_split_by_layer, row_split_by_direction)
 
 
 def _pack_sheet(np, spritesheet_root, sheet_name, frames,
-                row_split_by_action, row_split_by_layer, row_split_by_direction):
+                row_split_by_action, row_split_by_layer, row_split_by_direction,
+                renumber_frames=True, frame_num_padding=2):
     """
     Pack a list of frame dicts into one sprite sheet, optionally split into rows.
     Each frame dict: {"filepath": str, "action": str, "layer": str, "direction": str, "frame_num": int}
@@ -137,6 +138,12 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     sheet_arr = np.zeros((sheet_h, sheet_w, 4), dtype=np.float32)
     frames_meta = {}
 
+    # Build a flat index → frame_num map for renumbering
+    all_frames_sorted = []
+    for key in rows_ordered:
+        all_frames_sorted.extend(rows_map[key])
+    frame_index_map = {id(f): i for i, f in enumerate(all_frames_sorted)}
+
     for row_idx, key in enumerate(rows_ordered):
         y_px = row_idx * FRAME_HEIGHT
         for col_idx, f in enumerate(rows_map[key]):
@@ -158,7 +165,8 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             x_px = col_idx * FRAME_WIDTH
             sheet_arr[y_px:y_px + FRAME_HEIGHT, x_px:x_px + FRAME_WIDTH, :] = arr[:FRAME_HEIGHT, :FRAME_WIDTH, :]
 
-            sprite_name = f"{f['action']}_{f['layer']}_{f['direction']}_{f['frame_num']:04d}"
+            display_num = frame_index_map[id(f)] if renumber_frames else f["frame_num"]
+            sprite_name = f"{f['action']}_{f['layer']}_{f['direction']}_{display_num:0{frame_num_padding}d}"
             frames_meta[sprite_name] = {
                 "frame": {"x": x_px, "y": y_px, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
                 "rotated": False,
@@ -215,7 +223,8 @@ def _format_sheet_name(fmt, blendfile="", action="", layer="", direction=""):
 
 def _run_pack(export_root, spritesheet_root, sheet_name_format,
               split_by_action, split_by_layer, split_by_direction,
-              row_split_by_action, row_split_by_layer, row_split_by_direction):
+              row_split_by_action, row_split_by_layer, row_split_by_direction,
+              renumber_frames=True, frame_num_padding=2):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors)."""
     import numpy as np
 
@@ -269,7 +278,8 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
             direction=direction_key,
         )
         if _pack_sheet(np, spritesheet_root, sheet_name, frames,
-                       row_split_by_action, row_split_by_layer, row_split_by_direction):
+                       row_split_by_action, row_split_by_layer, row_split_by_direction,
+                       renumber_frames, frame_num_padding):
             generated += 1
         else:
             errors += 1
@@ -496,6 +506,18 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         name="Direction",
         description="Each direction gets its own row",
         default=True,
+    )
+    renumber_frames: bpy.props.BoolProperty(  # type: ignore
+        name="Renumber Frames",
+        description="Frame keys in the JSON start at 0 and are consecutive, instead of using original Blender frame numbers",
+        default=True,
+    )
+    frame_num_padding: bpy.props.IntProperty(  # type: ignore
+        name="Frame Number Padding",
+        description="Zero-pad frame numbers to this many digits (e.g. 4 → 0001)",
+        default=2,
+        min=1,
+        max=8,
     )
     show_scene_setup: bpy.props.BoolProperty(default=True)  # type: ignore
     show_render: bpy.props.BoolProperty(default=True)  # type: ignore
@@ -726,6 +748,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             settings.sheet_name_format,
             settings.split_by_action, settings.split_by_layer, settings.split_by_direction,
             settings.row_split_by_action, settings.row_split_by_layer, settings.row_split_by_direction,
+            settings.renumber_frames, settings.frame_num_padding,
         )
 
         _log(f"=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
@@ -856,6 +879,12 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             sub = row.row()
             sub.enabled = not settings.split_by_direction
             sub.prop(settings, "row_split_by_direction")
+
+            box.separator(factor=0.5)
+            row = box.row(align=True)
+            row.prop(settings, "renumber_frames")
+            sub = row.row(align=True)
+            sub.prop(settings, "frame_num_padding")
 
             box.separator(factor=0.5)
             box.prop(settings, "sheet_name_format")

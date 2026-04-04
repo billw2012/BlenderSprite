@@ -287,25 +287,19 @@ def _get_cloth_objects_in_layer(view_layer):
     ]
 
 
-def _bake_cloth_for_action(context, view_layers, action, warmup_frames):
+def _bake_cloth_for_layer_action(context, view_layer, action, warmup_frames):
     """
-    Bake cloth for a single action. Each action gets a fresh bake so cloth
-    simulation doesn't carry state from the previous action.
-    Frame range: action.frame_start - warmup_frames  to  action.frame_end.
+    Bake cloth for a single (view_layer, action) combination.
+    Sets the view layer active so cloth objects are correctly resolved.
     Returns number of objects baked.
     """
+    context.window.view_layer = view_layer
+
     bake_start = int(action.frame_range[0]) - warmup_frames
     bake_end   = int(action.frame_range[1])
-    _log(f"  Cloth bake '{action.name}': frames {bake_start}→{bake_end} (warmup: {warmup_frames})")
+    _log(f"  Cloth bake '{action.name}' / '{view_layer.name}': frames {bake_start}→{bake_end} (warmup: {warmup_frames})")
 
-    cloth_objs = []
-    seen = set()
-    for vl in view_layers:
-        for obj in _get_cloth_objects_in_layer(vl):
-            if obj.name not in seen:
-                cloth_objs.append(obj)
-                seen.add(obj.name)
-
+    cloth_objs = _get_cloth_objects_in_layer(view_layer)
     for obj in cloth_objs:
         for mod in obj.modifiers:
             if mod.type != 'CLOTH':
@@ -393,7 +387,8 @@ def _build_job_queue(context, export_root):
                         "camera_rig": camera_rig,
                     })
         if action_has_jobs and settings.bake_cloth:
-            jobs.append({"type": "bake", "action": action, "view_layers": view_layers})
+            for vl in view_layers:
+                jobs.append({"type": "bake", "action": action, "vl_name": vl.name})
         jobs.extend(action_jobs)
     return jobs, skipped
 
@@ -599,7 +594,9 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             armature_obj = settings.armature
             if armature_obj and armature_obj.animation_data:
                 armature_obj.animation_data.action = action
-            _bake_cloth_for_action(context, job["view_layers"], action, settings.cloth_warmup_frames)
+            view_layer = context.scene.view_layers.get(job["vl_name"])
+            if view_layer:
+                _bake_cloth_for_layer_action(context, view_layer, action, settings.cloth_warmup_frames)
             _log(f"=== Cloth bake done ===")
             self._job_index += 1
             return {"RUNNING_MODAL"}

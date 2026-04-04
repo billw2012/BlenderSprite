@@ -7,16 +7,6 @@ Adds a "SpriteLoom" tab in the 3D Viewport N-panel with a
 "Render All" button that runs the full render pipeline.
 """
 
-bl_info = {
-    "name": "SpriteLoom",
-    "author": "",
-    "version": (1, 0, 0),
-    "blender": (3, 0, 0),
-    "location": "View3D > Sidebar > SpriteLoom",
-    "description": "Render modular character sprite sheets for all actions, layers, and directions",
-    "category": "Render",
-}
-
 import math
 import os
 
@@ -85,13 +75,13 @@ def _resolve_view_layers(scene, filter_str):
     return list(scene.view_layers)
 
 
-def _resolve_path(prop_value, blend_relative_default):
-    """Return an absolute path from a settings string, falling back to blend-relative default."""
-    if prop_value:
-        return bpy.path.abspath(prop_value)
-    if bpy.data.filepath:
-        return os.path.join(os.path.dirname(bpy.path.abspath(bpy.data.filepath)), blend_relative_default)
-    return ""
+def _resolve_path(prop_value):
+    """Return an absolute path. Supports // Blender-relative paths. Returns '' if unresolvable."""
+    if not prop_value:
+        return ""
+    if prop_value.startswith("//") and not bpy.data.filepath:
+        return ""
+    return bpy.path.abspath(prop_value)
 
 
 def _frame_filename(action_name, layer_name, direction_name, frame):
@@ -448,12 +438,12 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         default=False,
     )
     split_by_action: bpy.props.BoolProperty(  # type: ignore
-        name="Split by Action",
+        name="Action",
         description="Generate a separate sprite sheet per action",
         default=True,
     )
     split_by_layer: bpy.props.BoolProperty(  # type: ignore
-        name="Split by Layer",
+        name="Layer",
         description="Generate a separate sprite sheet per view layer",
         default=True,
     )
@@ -481,15 +471,17 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
     last_result: bpy.props.StringProperty(default="")  # type: ignore
     export_root: bpy.props.StringProperty(  # type: ignore
         name="Export Root",
-        description="Folder for rendered frames. Leave blank to use <blend file dir>/export",
+        description="Folder for rendered frames. // paths are relative to the .blend file",
         subtype='DIR_PATH',
-        default="",
+        options={'PATH_SUPPORTS_BLEND_RELATIVE'},
+        default="//export",
     )
     spritesheet_root: bpy.props.StringProperty(  # type: ignore
         name="Spritesheet Root",
-        description="Folder for packed sprite sheets. Leave blank to use <blend file dir>/spritesheets",
+        description="Folder for packed sprite sheets. // paths are relative to the .blend file",
         subtype='DIR_PATH',
-        default="",
+        options={'PATH_SUPPORTS_BLEND_RELATIVE'},
+        default="//spritesheets",
     )
 
 
@@ -516,8 +508,8 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
 
     def execute(self, context):
         settings = context.scene.spriteloom
-        self._export_root = _resolve_path(settings.export_root, "export")
-        self._spritesheet_root = _resolve_path(settings.spritesheet_root, "spritesheets")
+        self._export_root = _resolve_path(settings.export_root)
+        self._spritesheet_root = _resolve_path(settings.spritesheet_root)
 
         if not self._export_root:
             self.report({"ERROR"}, "Save the .blend file first, or set an explicit Export Root path.")
@@ -718,6 +710,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         settings = context.scene.spriteloom
         scene = context.scene
 
+        if settings.armature is None or settings.camera_rig is None:
+            if not bpy.app.timers.is_registered(_auto_detect_all):
+                bpy.app.timers.register(_auto_detect_all, first_interval=0.0)
+
         # --- Scene Setup ---
         box = layout.box()
         row = box.row()
@@ -746,7 +742,16 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         row.prop(settings, "show_output", icon="TRIA_DOWN" if settings.show_output else "TRIA_RIGHT", emboss=False, text="Output", icon_only=False)
         row.label(icon="FILE_FOLDER")
         if settings.show_output:
-            box.prop(settings, "view_layers_filter")
+            box.label(text="View Layers:")
+            included = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()} if settings.view_layers_filter else None
+            grid = box.grid_flow(row_major=True, columns=2, align=True)
+            for vl in scene.view_layers:
+                is_on = included is None or vl.name in included
+                op = grid.operator("spriteloom.toggle_view_layer",
+                                   text=vl.name,
+                                   icon='CHECKBOX_HLT' if is_on else 'CHECKBOX_DEHLT',
+                                   emboss=False)
+                op.layer_name = vl.name
             box.prop(settings, "export_root")
             box.prop(settings, "spritesheet_root")
             box.prop(settings, "overwrite_frames")
@@ -757,11 +762,13 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         row.prop(settings, "show_sheet_layout", icon="TRIA_DOWN" if settings.show_sheet_layout else "TRIA_RIGHT", emboss=False, text="Sheet Layout", icon_only=False)
         row.label(icon="IMAGE_DATA")
         if settings.show_sheet_layout:
-            row = box.row()
+            box.label(text="File splits:")
+            row = box.row(align=True)
             row.prop(settings, "split_by_action")
             row.prop(settings, "split_by_layer")
+
             box.label(text="Row splits:")
-            row = box.row()
+            row = box.row(align=True)
             sub = row.row()
             sub.enabled = not settings.split_by_action
             sub.prop(settings, "row_split_by_action")
@@ -769,6 +776,28 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             sub.enabled = not settings.split_by_layer
             sub.prop(settings, "row_split_by_layer")
             row.prop(settings, "row_split_by_direction")
+
+            box.label(text="Example output:")
+            box.separator(factor=0.5)
+            example_actions = [a.name for a in bpy.data.actions if a.name.startswith("chr_")] or ["chr_walk", "chr_idle"]
+            example_layers = [vl.name for vl in _resolve_view_layers(scene, settings.view_layers_filter)] or ["Layer"]
+            seen = []
+            for action in example_actions:
+                for layer in example_layers:
+                    key_parts = []
+                    if settings.split_by_action:
+                        key_parts.append(action)
+                    if settings.split_by_layer:
+                        key_parts.append(layer)
+                    key = "--".join(key_parts) if key_parts else "spritesheet"
+                    if key not in seen:
+                        seen.append(key)
+            col = box.column(align=True)
+            col.scale_y = 0.75
+            for key in seen[:5]:
+                col.label(text=f"{key}.png", icon='FILE_IMAGE')
+            if len(seen) > 5:
+                col.label(text=f"+{len(seen) - 5} more…", icon='BLANK1')
 
         # --- Validation warnings ---
         issues = []
@@ -787,12 +816,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         active_layers = _resolve_view_layers(scene, settings.view_layers_filter)
         if not active_layers:
             issues.append(("ERROR", "No view layers to render"))
-        else:
-            issues.append(("INFO", f"Layers: {', '.join(vl.name for vl in active_layers)}"))
 
-        if not settings.export_root and not bpy.data.filepath:
-            issues.append(("ERROR", "No export path — save the .blend file first"))
-            issues.append(("INFO", "Hint: or set an explicit Export Root above"))
+        if not _resolve_path(settings.export_root):
+            issues.append(("ERROR", "Export path is relative — save the .blend file first"))
+            issues.append(("INFO", "Hint: or set an absolute Export Root path above"))
 
 
         if issues:
@@ -811,20 +838,77 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             row.operator("spriteloom.render_all", icon="RENDER_ANIMATION")
 
         if settings.last_result:
-            layout.separator()
+            result_box = layout.box()
+            result_box.label(text="Last Render", icon="INFO")
             for line in settings.last_result.split("\n"):
-                layout.label(text=line)
+                result_box.label(text=line)
 
 
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
+class SPRITELOOM_OT_ToggleViewLayer(bpy.types.Operator):
+    """Toggle a view layer on/off for rendering"""
+    bl_idname = "spriteloom.toggle_view_layer"
+    bl_label = "Toggle View Layer"
+
+    layer_name: bpy.props.StringProperty()  # type: ignore
+
+    def execute(self, context):
+        settings = context.scene.spriteloom
+        all_layers = [vl.name for vl in context.scene.view_layers]
+        if not settings.view_layers_filter:
+            included = set(all_layers)
+        else:
+            included = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()}
+        if self.layer_name in included:
+            included.discard(self.layer_name)
+        else:
+            included.add(self.layer_name)
+        if included == set(all_layers):
+            settings.view_layers_filter = ""
+        else:
+            settings.view_layers_filter = ", ".join(n for n in all_layers if n in included)
+        return {'FINISHED'}
+
+
 _classes = (
     SpriteLoomSettings,
     SPRITELOOM_OT_RenderAll,
+    SPRITELOOM_OT_ToggleViewLayer,
     SPRITELOOM_PT_Main,
 )
+
+
+def _auto_detect_all():
+    for scene in bpy.data.scenes:
+        _auto_detect(scene)
+    return None  # don't repeat
+
+
+def _auto_detect(scene):
+    """Auto-fill armature and camera_rig from scene objects if not already set."""
+    settings = scene.spriteloom
+    if settings.armature is None:
+        armatures = [o for o in scene.objects if o.type == 'ARMATURE']
+        if len(armatures) == 1:
+            settings.armature = armatures[0]
+        elif armatures:
+            by_name = {o.name.lower(): o for o in armatures}
+            for name in ("rig", "armature", "metarig"):
+                if name in by_name:
+                    settings.armature = by_name[name]
+                    break
+
+    if settings.camera_rig is None:
+        cameras = [o for o in scene.objects if o.type == 'CAMERA']
+        if scene.camera:
+            cameras = [scene.camera] + [c for c in cameras if c is not scene.camera]
+        for cam in cameras:
+            if cam.parent and cam.parent.type == 'EMPTY':
+                settings.camera_rig = cam.parent
+                break
 
 
 @bpy.app.handlers.persistent
@@ -833,14 +917,7 @@ def _set_default_armature(_):
         settings = scene.spriteloom
         settings.progress = ""
         settings.progress_factor = 0.0
-        if settings.armature is None:
-            rig = bpy.data.objects.get("rig")
-            if rig and rig.type == 'ARMATURE':
-                settings.armature = rig
-        if settings.camera_rig is None:
-            cam = scene.camera
-            if cam and cam.parent and cam.parent.type == 'EMPTY':
-                settings.camera_rig = cam.parent
+        _auto_detect(scene)
 
 
 def _purge_render_handlers():

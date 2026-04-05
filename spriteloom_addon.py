@@ -349,16 +349,24 @@ def _build_job_queue(context, export_root):
     if not chr_actions:
         return None, "No actions to render (none in file or all excluded)"
 
-    view_layers = _resolve_view_layers(scene, settings.view_layers_filter)
-    if not view_layers:
-        return None, "No view layers to render"
+    composite_mode = settings.output_mode == "COMPOSITE"
+
+    if composite_mode:
+        layer_iter = [("composite", None)]  # (label, view_layer_object)
+    else:
+        view_layers = _resolve_view_layers(scene, settings.view_layers_filter)
+        if not view_layers:
+            return None, "No view layers to render"
+        layer_iter = [(vl.name, vl) for vl in view_layers]
 
     directions = _get_directions(settings.num_directions)
     frame_step = settings.frame_step
     overwrite = settings.overwrite_frames
 
     _log(f"Found {len(chr_actions)} action(s): {[a.name for a in chr_actions]}")
-    _log(f"View layers : {[vl.name for vl in view_layers]}")
+    _log(f"Mode        : {'composite' if composite_mode else 'layered'}")
+    if not composite_mode:
+        _log(f"View layers : {[name for name, _ in layer_iter]}")
     _log(f"Directions  : {[d[0] for d in directions]}  ({len(directions)})")
     _log(f"Frame step  : {frame_step}")
     _log(f"Overwrite   : {overwrite}")
@@ -374,36 +382,37 @@ def _build_job_queue(context, export_root):
         action_has_jobs = False
         action_jobs = []
         os.makedirs(export_root, exist_ok=True)
-        for vl in view_layers:
+        for layer_name, _ in layer_iter:
             for direction_name, angle_radians in directions:
-                prefix = f"{action.name}--{vl.name}--{direction_name}--"
-                if not overwrite and _count_existing_frames(export_root, action.name, vl.name, direction_name) >= expected_frames:
-                    _log(f"  SKIP  {action.name}/{vl.name}/{direction_name} ({expected_frames} frames exist)")
+                prefix = f"{action.name}--{layer_name}--{direction_name}--"
+                if not overwrite and _count_existing_frames(export_root, action.name, layer_name, direction_name) >= expected_frames:
+                    _log(f"  SKIP  {action.name}/{layer_name}/{direction_name} ({expected_frames} frames exist)")
                     skipped += 1
                     continue
                 if overwrite:
                     for f in os.listdir(export_root):
                         if f.startswith(prefix) and f.lower().endswith(".png"):
                             os.remove(os.path.join(export_root, f))
-                    _log(f"  CLEAR {action.name}/{vl.name}/{direction_name}")
+                    _log(f"  CLEAR {action.name}/{layer_name}/{direction_name}")
                 action_has_jobs = True
                 for frame in frames:
                     action_jobs.append({
                         "type": "render",
                         "action": action,
-                        "vl_name": vl.name,
+                        "vl_name": layer_name,
+                        "composite_mode": composite_mode,
                         "direction_name": direction_name,
                         "angle_radians": angle_radians,
-                        "out_path": os.path.join(export_root, _frame_filename(action.name, vl.name, direction_name, frame)),
+                        "out_path": os.path.join(export_root, _frame_filename(action.name, layer_name, direction_name, frame)),
                         "frame": frame,
                         "frame_start": frame_start,
                         "frame_end": frame_end,
                         "armature_obj": armature_obj,
                         "camera_rig": camera_rig,
                     })
-        if action_has_jobs and settings.bake_cloth:
-            for vl in view_layers:
-                jobs.append({"type": "bake", "action": action, "vl_name": vl.name})
+        if action_has_jobs and not composite_mode and settings.bake_cloth:
+            for layer_name, _ in layer_iter:
+                jobs.append({"type": "bake", "action": action, "vl_name": layer_name})
         jobs.extend(action_jobs)
     return jobs, skipped
 
@@ -447,6 +456,15 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         default=1,
         min=1,
         max=64,
+    )
+    output_mode: bpy.props.EnumProperty(  # type: ignore
+        name="Output Mode",
+        description="How to handle view layers during rendering",
+        items=[
+            ("LAYERED", "Layered", "Render each view layer separately using compositor node overrides"),
+            ("COMPOSITE", "Composite", "Render the full compositor output as-is — no layer separation"),
+        ],
+        default="LAYERED",
     )
     view_layers_filter: bpy.props.StringProperty(  # type: ignore
         name="View Layers",
@@ -522,6 +540,7 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         min=1,
         max=8,
     )
+    camera_rig_saved_rotation: bpy.props.FloatProperty(default=float('nan'), options={'SKIP_SAVE'})  # type: ignore
     show_scene_setup: bpy.props.BoolProperty(default=True)  # type: ignore
     show_render: bpy.props.BoolProperty(default=True)  # type: ignore
     show_output: bpy.props.BoolProperty(default=True)  # type: ignore
@@ -665,6 +684,11 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
 
         if armature_obj.animation_data is None:
             armature_obj.animation_data_create()
+        orig_use_nla = armature_obj.animation_data.use_nla
+        if orig_use_nla:
+            _log(f"  [render] disabling NLA on '{armature_obj.name}' (was enabled) to prevent T-pose override")
+            armature_obj.animation_data.use_nla = False
+        _log(f"  [render] assigning action '{action.name}' to '{armature_obj.name}'")
         armature_obj.animation_data.action = action
 
         camera_rig.rotation_euler.z = job["angle_radians"]
@@ -683,21 +707,33 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         orig_file_format = fmt.file_format
         orig_color_mode = fmt.color_mode
 
-        # Point all R_LAYERS compositor nodes at the target view layer
+        is_composite = job.get("composite_mode", False)
+
+        # In layered mode: point all R_LAYERS compositor nodes at the target view layer
         nt = scene.compositing_node_group
         rl_orig = {}
-        if nt:
+        orig_window_vl = context.window.view_layer
+        if not is_composite and nt:
             for node in nt.nodes:
                 if node.type == 'R_LAYERS':
                     rl_orig[node.name] = node.layer
                     node.layer = job["vl_name"]
+
+        if not is_composite:
+            target_vl = scene.view_layers.get(job["vl_name"])
+            if target_vl and orig_window_vl != target_vl:
+                _log(f"  [render] switching window view layer: '{orig_window_vl.name}' → '{target_vl.name}'")
+                context.window.view_layer = target_vl
 
         try:
             scene.render.filepath = out_path
             fmt.media_type = "IMAGE"
             fmt.file_format = "PNG"
             fmt.color_mode = "RGBA"
-            bpy.ops.render.render("EXEC_DEFAULT", write_still=True, layer=job["vl_name"])
+            if is_composite:
+                bpy.ops.render.render("EXEC_DEFAULT", write_still=True)
+            else:
+                bpy.ops.render.render("EXEC_DEFAULT", write_still=True, layer=job["vl_name"])
             _log(f"    OK  saved={out_path}")
             self._rendered += 1
         except Exception as exc:
@@ -712,6 +748,12 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 for node in nt.nodes:
                     if node.type == 'R_LAYERS' and node.name in rl_orig:
                         node.layer = rl_orig[node.name]
+            if context.window.view_layer != orig_window_vl:
+                _log(f"  [render] restoring window view layer to '{orig_window_vl.name}'")
+                context.window.view_layer = orig_window_vl
+            if armature_obj.animation_data and armature_obj.animation_data.use_nla != orig_use_nla:
+                _log(f"  [render] restoring NLA on '{armature_obj.name}' to {orig_use_nla}")
+                armature_obj.animation_data.use_nla = orig_use_nla
 
         self._job_index += 1
         return {"RUNNING_MODAL"}
@@ -798,6 +840,21 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         if settings.show_scene_setup:
             box.prop(settings, "armature")
             box.prop(settings, "camera_rig")
+            if settings.camera_rig:
+                directions = _get_directions(settings.num_directions)
+                cols = min(len(directions), 4)
+                import math
+                saved = settings.camera_rig_saved_rotation
+                has_preview = not math.isnan(saved)
+                grid = box.grid_flow(row_major=True, columns=cols, even_columns=True, even_rows=False, align=True)
+                for name, angle in directions:
+                    op = grid.operator("spriteloom.preview_direction", text=name)
+                    op.angle = angle
+                    op.label = name
+                row = box.row()
+                sub = row.row()
+                sub.enabled = has_preview
+                sub.operator("spriteloom.reset_camera_direction", text="Reset Camera", icon="LOOP_BACK")
 
         # --- Render Settings ---
         box = layout.box()
@@ -831,10 +888,11 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                     nav.action_name = a.name
             else:
                 actions_box.label(text="No actions in file", icon='INFO')
-            row = box.row(align=True)
-            row.prop(settings, "bake_cloth")
-            if settings.bake_cloth:
-                row.prop(settings, "cloth_warmup_frames")
+            if settings.output_mode == "LAYERED":
+                row = box.row(align=True)
+                row.prop(settings, "bake_cloth")
+                if settings.bake_cloth:
+                    row.prop(settings, "cloth_warmup_frames")
 
         # --- Output Paths ---
         box = layout.box()
@@ -842,21 +900,29 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         row.prop(settings, "show_output", icon="TRIA_DOWN" if settings.show_output else "TRIA_RIGHT", emboss=False, text="Output", icon_only=False)
         row.label(icon="FILE_FOLDER")
         if settings.show_output:
-            layers_box = box.box()
-            layers_box.label(text="View Layers", icon="RENDERLAYERS")
-            excluded = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()}
-            col = layers_box.column(align=True)
-            col.scale_y = 0.75
-            for vl in scene.view_layers:
-                is_on = vl.name not in excluded
-                row = col.row(align=True)
-                op = row.operator("spriteloom.toggle_view_layer",
-                                   text=vl.name,
-                                   icon='CHECKBOX_HLT' if is_on else 'CHECKBOX_DEHLT',
-                                   emboss=False)
-                op.layer_name = vl.name
-                act = row.operator("spriteloom.activate_view_layer", text="", icon='LINKED', emboss=False)
-                act.layer_name = vl.name
+            row = box.row(align=True)
+            row.label(text="Mode:")
+            row.prop(settings, "output_mode", expand=True)
+
+            if settings.output_mode == "LAYERED":
+                layers_box = box.box()
+                layers_box.label(text="View Layers", icon="RENDERLAYERS")
+                excluded = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()}
+                col = layers_box.column(align=True)
+                col.scale_y = 0.75
+                for vl in scene.view_layers:
+                    is_on = vl.name not in excluded
+                    row = col.row(align=True)
+                    op = row.operator("spriteloom.toggle_view_layer",
+                                       text=vl.name,
+                                       icon='CHECKBOX_HLT' if is_on else 'CHECKBOX_DEHLT',
+                                       emboss=False)
+                    op.layer_name = vl.name
+                    act = row.operator("spriteloom.activate_view_layer", text="", icon='LINKED', emboss=False)
+                    act.layer_name = vl.name
+            else:
+                box.label(text="Renders compositor output as-is. Set up compositing in Blender.", icon='INFO')
+
             box.prop(settings, "export_root")
             box.prop(settings, "spritesheet_root")
             box.prop(settings, "clean_output")
@@ -903,7 +969,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
             _ex_excluded = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
             example_actions = [a.name for a in bpy.data.actions if a.name not in _ex_excluded] or ["chr_walk", "chr_idle"]
-            example_layers = [vl.name for vl in _resolve_view_layers(scene, settings.view_layers_filter)] or ["Layer"]
+            if settings.output_mode == "COMPOSITE":
+                example_layers = ["composite"]
+            else:
+                example_layers = [vl.name for vl in _resolve_view_layers(scene, settings.view_layers_filter)] or ["Layer"]
             example_directions = [d[0] for d in _get_directions(settings.num_directions)]
             seen = []
             for action in example_actions:
@@ -941,9 +1010,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             if bpy.data.actions:
                 issues.append(("INFO", "Hint: uncheck at least one action above"))
 
-        active_layers = _resolve_view_layers(scene, settings.view_layers_filter)
-        if not active_layers:
-            issues.append(("ERROR", "No view layers to render"))
+        if settings.output_mode == "LAYERED":
+            active_layers = _resolve_view_layers(scene, settings.view_layers_filter)
+            if not active_layers:
+                issues.append(("ERROR", "No view layers to render"))
 
         if not _resolve_path(settings.export_root):
             issues.append(("ERROR", "Export path is relative — save the .blend file first"))
@@ -1021,6 +1091,45 @@ class SPRITELOOM_OT_ActivateViewLayer(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SPRITELOOM_OT_PreviewDirection(bpy.types.Operator):
+    """Set camera rig rotation to preview a render direction"""
+    bl_idname = "spriteloom.preview_direction"
+    bl_label = "Preview Direction"
+
+    angle: bpy.props.FloatProperty()  # type: ignore
+    label: bpy.props.StringProperty()  # type: ignore
+
+    def execute(self, context):
+        s = context.scene.spriteloom
+        rig = s.camera_rig
+        if not rig:
+            self.report({'ERROR'}, "No camera rig set")
+            return {'CANCELLED'}
+        import math
+        if math.isnan(s.camera_rig_saved_rotation):
+            s.camera_rig_saved_rotation = rig.rotation_euler[2]
+        rig.rotation_euler[2] = self.angle
+        return {'FINISHED'}
+
+
+class SPRITELOOM_OT_ResetCameraDirection(bpy.types.Operator):
+    """Restore camera rig to its original rotation"""
+    bl_idname = "spriteloom.reset_camera_direction"
+    bl_label = "Reset"
+
+    def execute(self, context):
+        import math
+        s = context.scene.spriteloom
+        rig = s.camera_rig
+        if not rig:
+            self.report({'ERROR'}, "No camera rig set")
+            return {'CANCELLED'}
+        if not math.isnan(s.camera_rig_saved_rotation):
+            rig.rotation_euler[2] = s.camera_rig_saved_rotation
+            s.camera_rig_saved_rotation = float('nan')
+        return {'FINISHED'}
+
+
 class SPRITELOOM_OT_ToggleAction(bpy.types.Operator):
     """Toggle an action on/off for rendering"""
     bl_idname = "spriteloom.toggle_action"
@@ -1066,6 +1175,8 @@ _classes = (
     SPRITELOOM_OT_ActivateViewLayer,
     SPRITELOOM_OT_ToggleAction,
     SPRITELOOM_OT_ToggleViewLayer,
+    SPRITELOOM_OT_PreviewDirection,
+    SPRITELOOM_OT_ResetCameraDirection,
     SPRITELOOM_PT_Main,
 )
 

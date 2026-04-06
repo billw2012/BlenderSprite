@@ -47,6 +47,20 @@ _DIRECTION_COUNTS = {
 def _get_directions(num_directions_str):
     return _DIRECTION_COUNTS.get(num_directions_str, _DIRECTION_COUNTS["8"])
 
+
+def _get_direction_label(angle_radians):
+    """Return the name of the closest known direction for a given angle in radians."""
+    tau = 2 * math.pi
+    angle = angle_radians % tau
+    best_name, best_dist = None, tau
+    for name, candidate in _ALL_DIRECTIONS:
+        dist = min(abs(angle - candidate % tau), tau - abs(angle - candidate % tau))
+        if dist < best_dist:
+            best_dist, best_name = dist, name
+    threshold = math.pi / 32  # within ~5.6 degrees = exact match
+    prefix = "" if best_dist < threshold else "~"
+    return f"{prefix}{best_name}"
+
 FRAME_WIDTH = 64
 FRAME_HEIGHT = 64
 FRAME_DURATION_MS = 100
@@ -327,6 +341,18 @@ def _bake_cloth_for_layer_action(context, view_layer, action, warmup_frames):
     return len(cloth_objs)
 
 
+_NORMAL_OUTPUT_NODE_NAME = "Normal Output"
+
+
+def _find_normal_output_node(nt):
+    """Return the File Output node named 'Normal Output', or None."""
+    return next(
+        (n for n in nt.nodes
+         if n.type == 'OUTPUT_FILE' and n.name == _NORMAL_OUTPUT_NODE_NAME),
+        None,
+    )
+
+
 def _build_job_queue(context, export_root):
     """
     Build the full list of render jobs. Each job is a single frame to render.
@@ -542,7 +568,6 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
     )
     camera_rig_saved_rotation: bpy.props.FloatProperty(default=float('nan'), options={'SKIP_SAVE'})  # type: ignore
     show_scene_setup: bpy.props.BoolProperty(default=True)  # type: ignore
-    show_render: bpy.props.BoolProperty(default=True)  # type: ignore
     show_output: bpy.props.BoolProperty(default=True)  # type: ignore
     show_sheet_layout: bpy.props.BoolProperty(default=True)  # type: ignore
     progress: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})  # type: ignore
@@ -561,6 +586,11 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         subtype='DIR_PATH',
         options={'PATH_SUPPORTS_BLEND_RELATIVE'},
         default="//spritesheets",
+    )
+    render_normals: bpy.props.BoolProperty(  # type: ignore
+        name="Render Normal Maps",
+        description="Capture Normal render pass alongside beauty and pack into *_normal sprite sheets",
+        default=False,
     )
 
 
@@ -584,11 +614,15 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
     _errors = 0
     _export_root = ""
     _spritesheet_root = ""
+    _normal_export_root = ""
+    _normal_spritesheet_root = ""
 
     def execute(self, context):
         settings = context.scene.spriteloom
         self._export_root = _resolve_path(settings.export_root)
         self._spritesheet_root = _resolve_path(settings.spritesheet_root)
+        self._normal_export_root = self._export_root.rstrip("/\\") + "_normal"
+        self._normal_spritesheet_root = self._spritesheet_root.rstrip("/\\") + "_normal"
 
         if not self._export_root:
             self.report({"ERROR"}, "Save the .blend file first, or set an explicit Export Root path.")
@@ -667,6 +701,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             return {"RUNNING_MODAL"}
 
         scene = context.scene
+        settings = scene.spriteloom
         action = job["action"]
         armature_obj = job["armature_obj"]
         camera_rig = job["camera_rig"]
@@ -725,6 +760,21 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 _log(f"  [render] switching window view layer: '{orig_window_vl.name}' → '{target_vl.name}'")
                 context.window.view_layer = target_vl
 
+        # Redirect the existing "Normal Output" File Output compositor node for this frame
+        normal_node = None
+        orig_normal_directory = None
+        orig_normal_item_name = None
+        if settings.render_normals and nt:
+            normal_node = _find_normal_output_node(nt)
+            if normal_node:
+                os.makedirs(self._normal_export_root, exist_ok=True)
+                orig_normal_directory = normal_node.directory
+                orig_normal_item_name = normal_node.file_output_items[0].name
+                normal_node.directory = self._normal_export_root
+                normal_node.file_output_items[0].name = (
+                    f"{job['action'].name}--{job['vl_name']}--{job['direction_name']}--"
+                )
+
         try:
             scene.render.filepath = out_path
             fmt.media_type = "IMAGE"
@@ -740,6 +790,9 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             _log(f"    ERROR {label} frame {frame}: {exc}")
             self._errors += 1
         finally:
+            if normal_node:
+                normal_node.directory = orig_normal_directory
+                normal_node.file_output_items[0].name = orig_normal_item_name
             scene.render.filepath = orig_filepath
             fmt.media_type = orig_media_type
             fmt.file_format = orig_file_format
@@ -802,10 +855,25 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         _log(f"=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
 
         total_errors = self._errors + pack_errors
-        context.scene.spriteloom.last_result = "\n".join([
+        result_lines = [
             f"Rendered: {self._rendered}  Skipped: {self._skipped}  Errors: {self._errors}",
             f"Sheets: {packed}  Skipped: {pack_skipped}  Errors: {pack_errors}",
-        ])
+        ]
+
+        if settings.render_normals and os.path.isdir(self._normal_export_root):
+            _log("=== SpriteLoom: Packing normal map sprites ===")
+            n_packed, n_skipped, n_errors = _run_pack(
+                self._normal_export_root, self._normal_spritesheet_root,
+                settings.sheet_name_format,
+                settings.split_by_action, settings.split_by_layer, settings.split_by_direction,
+                settings.row_split_by_action, settings.row_split_by_layer, settings.row_split_by_direction,
+                settings.renumber_frames, settings.frame_num_padding,
+            )
+            _log(f"=== Normal pack complete — {n_packed} generated, {n_skipped} skipped, {n_errors} errors ===")
+            total_errors += n_errors
+            result_lines.append(f"Normal sheets: {n_packed}  Skipped: {n_skipped}  Errors: {n_errors}")
+
+        context.scene.spriteloom.last_result = "\n".join(result_lines)
         self.report({"WARNING"} if total_errors > 0 else {"INFO"},
                     f"Render {self._rendered} | Pack {packed} | Errors {total_errors}")
 
@@ -840,28 +908,6 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         if settings.show_scene_setup:
             box.prop(settings, "armature")
             box.prop(settings, "camera_rig")
-            if settings.camera_rig:
-                directions = _get_directions(settings.num_directions)
-                cols = min(len(directions), 4)
-                import math
-                saved = settings.camera_rig_saved_rotation
-                has_preview = not math.isnan(saved)
-                grid = box.grid_flow(row_major=True, columns=cols, even_columns=True, even_rows=False, align=True)
-                for name, angle in directions:
-                    op = grid.operator("spriteloom.preview_direction", text=name)
-                    op.angle = angle
-                    op.label = name
-                row = box.row()
-                sub = row.row()
-                sub.enabled = has_preview
-                sub.operator("spriteloom.reset_camera_direction", text="Reset Camera", icon="LOOP_BACK")
-
-        # --- Render Settings ---
-        box = layout.box()
-        row = box.row()
-        row.prop(settings, "show_render", icon="TRIA_DOWN" if settings.show_render else "TRIA_RIGHT", emboss=False, text="Render", icon_only=False)
-        row.label(icon="RENDER_ANIMATION")
-        if settings.show_render:
             box.prop(settings, "num_directions")
             box.prop(settings, "frame_step")
             actions_box = box.box()
@@ -886,6 +932,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                     op.action_name = a.name
                     nav = row.operator("spriteloom.focus_action", text="", icon='LINKED', emboss=False)
                     nav.action_name = a.name
+                    if not a.use_fake_user:
+                        warn = row.row()
+                        warn.alert = True
+                        warn.label(text="", icon='ERROR')
             else:
                 actions_box.label(text="No actions in file", icon='INFO')
             if settings.output_mode == "LAYERED":
@@ -893,6 +943,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 row.prop(settings, "bake_cloth")
                 if settings.bake_cloth:
                     row.prop(settings, "cloth_warmup_frames")
+            else:
+                row = box.row()
+                row.enabled = False
+                row.label(text="Cloth bake unavailable in Composite mode (layers are merged by the compositor)", icon='INFO')
 
         # --- Output Paths ---
         box = layout.box()
@@ -927,6 +981,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.prop(settings, "spritesheet_root")
             box.prop(settings, "clean_output")
             box.prop(settings, "overwrite_frames")
+            box.prop(settings, "render_normals")
 
         # --- Sheet Layout ---
         box = layout.box()
@@ -1019,27 +1074,166 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             issues.append(("ERROR", "Export path is relative — save the .blend file first"))
             issues.append(("INFO", "Hint: or set an absolute Export Root path above"))
 
+        if settings.render_normals:
+            if not scene.use_nodes or scene.compositing_node_group is None:
+                issues.append(("ERROR", "Normal map export requires compositor nodes — enable Use Nodes in the compositor"))
+            elif _find_normal_output_node(scene.compositing_node_group) is None:
+                issues.append(("ERROR", "Normal map export requires a File Output node named \"Normal Output\" in the compositor"))
+
+        # --- Preview box ---
+        layout.separator()
+        vp_box = layout.box()
+        vp_col = vp_box.column(align=True)
+        vp_col.label(text="Preview", icon="RENDER_ANIMATION")
+
+        # Camera direction group
+        if settings.camera_rig:
+            import math as _math
+            dir_box = vp_box.box()
+            dir_box.label(text="Camera Direction", icon="ORIENTATION_VIEW")
+            directions = _get_directions(settings.num_directions)
+            cols = min(len(directions), 4)
+            grid = dir_box.grid_flow(row_major=True, columns=cols, even_columns=True, even_rows=False, align=True)
+            for name, angle in directions:
+                op = grid.operator("spriteloom.preview_direction", text=name)
+                op.angle = angle
+                op.label = name
+            saved = settings.camera_rig_saved_rotation
+            reset_row = dir_box.row()
+            reset_row.enabled = not _math.isnan(saved)
+            reset_row.operator("spriteloom.reset_camera_direction", text="Reset Camera", icon="LOOP_BACK")
+
+        vp_armature = settings.armature
+        vp_action = (
+            vp_armature.animation_data.action
+            if vp_armature and vp_armature.animation_data
+            else None
+        )
+        vp_col = vp_box.column(align=True)
+        if vp_action:
+            vp_col.label(text=f"Action: {vp_action.name}", icon="ACTION")
+            vp_col.label(
+                text=f"Frames: {int(vp_action.frame_range[0])}–{int(vp_action.frame_range[1])}",
+                icon="TIME",
+            )
+        else:
+            vp_col.label(text="Action: (none active on armature)", icon="ERROR")
+
+        if settings.camera_rig:
+            dir_label = _get_direction_label(settings.camera_rig.rotation_euler.z)
+            vp_col.label(text=f"Direction: {dir_label}", icon="ORIENTATION_VIEW")
+        else:
+            vp_col.label(text="Direction: (no camera rig)", icon="ERROR")
+
+        if settings.bake_cloth:
+            vp_col.label(
+                text=f"Cloth bake: yes (warmup {settings.cloth_warmup_frames} frames)",
+                icon="MOD_CLOTH",
+            )
+
+        vp_row = vp_box.row()
+        vp_row.enabled = vp_action is not None
+        vp_row.operator("spriteloom.render_video_preview", icon="RENDER_ANIMATION")
+
+        # --- Render box ---
+        layout.separator()
+        render_box = layout.box()
+        render_col = render_box.column(align=True)
+        render_col.label(text="Render", icon="RENDERLAYERS")
 
         if issues:
-            layout.separator()
             for icon, text in issues:
-                layout.label(text=text, icon=icon)
+                render_col.label(text=text, icon=icon)
 
-        layout.separator()
         if settings.progress:
-            layout.progress(factor=settings.progress_factor, type="BAR", text=settings.progress)
-            layout.label(text="Press ESC to cancel", icon="X")
+            render_box.progress(factor=settings.progress_factor, type="BAR", text=settings.progress)
+            render_box.label(text="Press ESC to cancel", icon="X")
         else:
             blocking = any(icon == "ERROR" for icon, _ in issues)
-            row = layout.row()
+            row = render_box.row()
             row.enabled = not blocking
-            row.operator("spriteloom.render_all", icon="RENDER_ANIMATION")
+            row.operator("spriteloom.render_all", icon="RENDERLAYERS")
 
         if settings.last_result:
-            result_box = layout.box()
-            result_box.label(text="Last Render", icon="INFO")
             for line in settings.last_result.split("\n"):
-                result_box.label(text=line)
+                render_col.label(text=line)
+
+
+# ---------------------------------------------------------------------------
+# Video Preview Operator
+# ---------------------------------------------------------------------------
+
+
+class SPRITELOOM_OT_RenderVideoPreview(bpy.types.Operator):
+    """Render the current active action at the current camera angle as a video, then open it"""
+
+    bl_idname = "spriteloom.render_video_preview"
+    bl_label = "Render Video Preview"
+    bl_description = "Render the active action and current camera direction as an MP4, then open it"
+
+    def execute(self, context):
+        import subprocess, sys
+
+        scene = context.scene
+        settings = scene.spriteloom
+
+        armature = settings.armature
+        if not armature or not armature.animation_data or not armature.animation_data.action:
+            self.report({"ERROR"}, "No active action on the armature")
+            return {"CANCELLED"}
+
+        action = armature.animation_data.action
+        export_root = _resolve_path(settings.export_root)
+        if not export_root:
+            self.report({"ERROR"}, "Export Root path is not set or the .blend file is unsaved")
+            return {"CANCELLED"}
+        preview_dir = os.path.join(export_root, "previews")
+        os.makedirs(preview_dir, exist_ok=True)
+        video_path = os.path.join(preview_dir, f"{action.name}_preview.mp4")
+
+        # Bake cloth if needed
+        if settings.bake_cloth:
+            vls = _resolve_view_layers(scene, settings.view_layers_filter)
+            for vl in vls:
+                if _get_cloth_objects_in_layer(vl):
+                    _bake_cloth_for_layer_action(
+                        context, vl, action, settings.cloth_warmup_frames
+                    )
+
+        # Save render state
+        orig_filepath = scene.render.filepath
+        orig_format = scene.render.image_settings.file_format
+        orig_frame_start = scene.frame_start
+        orig_frame_end = scene.frame_end
+
+        try:
+            scene.frame_start = int(action.frame_range[0])
+            scene.frame_end = int(action.frame_range[1])
+            scene.render.filepath = video_path
+            scene.render.image_settings.file_format = "FFMPEG"
+            scene.render.ffmpeg.format = "MPEG4"
+            scene.render.ffmpeg.codec = "H264"
+            scene.render.ffmpeg.constant_rate_factor = "HIGH"
+
+            bpy.ops.render.render("EXEC_DEFAULT", animation=True)
+        finally:
+            scene.render.filepath = orig_filepath
+            scene.render.image_settings.file_format = orig_format
+            scene.frame_start = orig_frame_start
+            scene.frame_end = orig_frame_end
+
+        if os.path.exists(video_path):
+            if sys.platform == "win32":
+                subprocess.Popen(["start", "", video_path], shell=True)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", video_path])
+            else:
+                subprocess.Popen(["xdg-open", video_path])
+            self.report({"INFO"}, f"Video saved: {video_path}")
+        else:
+            self.report({"WARNING"}, "Render finished but output file not found")
+
+        return {"FINISHED"}
 
 
 # ---------------------------------------------------------------------------
@@ -1171,6 +1365,7 @@ class SPRITELOOM_OT_ToggleViewLayer(bpy.types.Operator):
 _classes = (
     SpriteLoomSettings,
     SPRITELOOM_OT_RenderAll,
+    SPRITELOOM_OT_RenderVideoPreview,
     SPRITELOOM_OT_FocusAction,
     SPRITELOOM_OT_ActivateViewLayer,
     SPRITELOOM_OT_ToggleAction,

@@ -17,6 +17,7 @@ Blender addon for rendering modular 2D character sprite sheets across all action
 - Configurable frame number zero-padding (default 2 digits)
 - Live example output preview in the Sheet Layout panel
 - Cloth simulation baking per view layer / action combination before rendering
+- Normal map rendering — enable **Render Normal Maps** in Output; SpriteLoom redirects a pre-existing **"Normal Output"** File Output node in the compositor each frame and packs results into `*_normal` sprite sheets
 - Clean Before Render option to wipe the export folder before each run
 - Resume support — skips frames that already exist on disk (when clean is off)
 - Auto-detects armature and camera rig from the scene
@@ -57,6 +58,15 @@ All view layers are rendered by default; deselect individual layers in the panel
 ### Compositor
 SpriteLoom renders via Blender's compositor. Set up the compositor with a **Render Layers** (View Layer) input node connected to your output. SpriteLoom automatically updates the View Layer input to the current layer before each render, so a single compositor graph handles all layers correctly without any manual switching.
 
+#### Normal Maps
+To export normal map sprite sheets alongside the beauty render:
+
+1. Enable the **Normal** pass in View Layer Properties (Properties → View Layer → Passes → Data → Normal)
+2. In the compositor, add a **File Output** node, rename it exactly **`Normal Output`**, and connect the **Normal** socket from your Render Layers node to its input
+3. Enable **Render Normal Maps** in the SpriteLoom Output panel
+
+SpriteLoom will redirect this node's output path each frame and pack the results into `<export_root>_normal/` and `<spritesheet_root>_normal/` alongside your regular sprite sheets.
+
 The simplest setup: **Render Layers → Composite**. Any colour correction, alpha-over, or other nodes between them will be applied consistently to every layer and direction.
 
 ## Panel Reference
@@ -84,6 +94,7 @@ The simplest setup: **Render Layers → Composite**. Any colour correction, alph
 | Spritesheet Root | Folder for packed sprite sheets |
 | Clean Before Render | Delete all files in the export folder before starting |
 | Overwrite Existing Frames | Re-render frames that already exist on disk |
+| Render Normal Maps | Redirect the "Normal Output" compositor node each frame and pack results into `*_normal` sprite sheets |
 
 ### Sheet Layout
 | Field | Description |

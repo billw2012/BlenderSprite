@@ -241,8 +241,15 @@ def _format_sheet_name(fmt, blendfile="", action="", layer="", direction=""):
 def _run_pack(export_root, spritesheet_root, sheet_name_format,
               split_by_action, split_by_layer, split_by_direction,
               row_split_by_action, row_split_by_layer, row_split_by_direction,
-              renumber_frames=True, frame_num_padding=2):
-    """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors)."""
+              renumber_frames=True, frame_num_padding=2,
+              frame_tag=None):
+    """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors).
+
+    frame_tag: sanitized tag string (no dashes, e.g. 'n'). When set, only 5-part stems are
+               parsed (action--layer--direction--tag--frame), the tag is verified against
+               parts[3], and appended to the sheet name. When None, 4-part beauty stems are
+               parsed (action--layer--direction--frame).
+    """
     import numpy as np
 
     if not os.path.isdir(export_root):
@@ -255,21 +262,25 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
 
     blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
 
-    # Parse all flat PNGs: {action}--{layer}--{direction}--{frame:04d}.png
+    # Beauty:  action--layer--direction--0024.png         (4-part stem)
+    # Normals: action--layer--direction--n--0024.png      (5-part stem)
     all_frames = []
     for fname in os.listdir(export_root):
         if not fname.lower().endswith(".png"):
             continue
-        stem = fname[:-4]
-        parts = stem.split("--")
-        if len(parts) != 4 or not parts[3].isdigit():
-            continue
+        parts = fname[:-4].split("--")
+        if frame_tag:
+            if len(parts) != 5 or parts[3] != frame_tag or not parts[4].isdigit():
+                continue
+        else:
+            if len(parts) != 4 or not parts[3].isdigit():
+                continue
         all_frames.append({
             "filepath": os.path.join(export_root, fname),
             "action": parts[0],
             "layer": parts[1],
             "direction": parts[2],
-            "frame_num": int(parts[3]),
+            "frame_num": int(parts[4 if frame_tag else 3]),
         })
 
     if not all_frames:
@@ -293,7 +304,7 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
             action=action_key,
             layer=layer_key,
             direction=direction_key,
-        )
+        ) + (f"--{frame_tag}" if frame_tag else "")
         if _pack_sheet(np, spritesheet_root, sheet_name, frames,
                        row_split_by_action, row_split_by_layer, row_split_by_direction,
                        renumber_frames, frame_num_padding):
@@ -670,8 +681,13 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
     )
     render_normals: bpy.props.BoolProperty(  # type: ignore
         name="Render Normal Maps",
-        description="Capture Normal render pass alongside beauty and pack into *_normal sprite sheets",
+        description="Capture Normal render pass alongside beauty, saved with a tag suffix",
         default=False,
+    )
+    normal_tag: bpy.props.StringProperty(  # type: ignore
+        name="Normal Tag",
+        description="Tag used to identify normal map files (dashes are stripped; e.g. 'n' → action--layer--direction--n--0024.png)",
+        default="n",
     )
 
 
@@ -851,8 +867,6 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
     _errors = 0
     _export_root = ""
     _spritesheet_root = ""
-    _normal_export_root = ""
-    _normal_spritesheet_root = ""
     _active_cloth_paths = {}
     _last_cloth_combo = None
 
@@ -860,8 +874,6 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         settings = context.scene.spriteloom
         self._export_root = _resolve_path(settings.export_root)
         self._spritesheet_root = _resolve_path(settings.spritesheet_root)
-        self._normal_export_root = self._export_root.rstrip("/\\") + "_normal"
-        self._normal_spritesheet_root = self._spritesheet_root.rstrip("/\\") + "_normal"
 
         if not self._export_root:
             self.report({"ERROR"}, "Save the .blend file first, or set an explicit Export Root path.")
@@ -1023,20 +1035,26 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 _log(f"  [render] switching window view layer: '{orig_window_vl.name}' → '{target_vl.name}'")
                 context.window.view_layer = target_vl
 
-        # Redirect the existing "Normal Output" File Output compositor node for this frame
+        # Redirect the existing "Normal Output" File Output compositor node for this frame.
+        # Blender writes {directory}/{node.file_name}{item.name}.ext with no auto frame
+        # number. We set file_name to the full per-frame path and clear item.name:
+        #   action--layer--direction--n--0024.png  (5-part stem, same export dir as beauty)
+        #   action--layer--direction--0024.png      (4-part stem, beauty)
         normal_node = None
-        orig_normal_directory = None
-        orig_normal_item_name = None
+        orig_normal_directory = orig_normal_file_name = orig_normal_item_name = orig_normal_fmt = None
         if settings.render_normals and nt:
             normal_node = _find_normal_output_node(nt)
             if normal_node:
-                os.makedirs(self._normal_export_root, exist_ok=True)
                 orig_normal_directory = normal_node.directory
+                orig_normal_file_name = normal_node.file_name
                 orig_normal_item_name = normal_node.file_output_items[0].name
-                normal_node.directory = self._normal_export_root
-                normal_node.file_output_items[0].name = (
-                    f"{job['action'].name}--{job['vl_name']}--{job['direction_name']}--"
-                )
+                orig_normal_fmt = normal_node.format.file_format
+                tag = settings.normal_tag.replace("-", "").strip()
+                normal_node.directory = self._export_root
+                normal_node.file_name = (f"{job['action'].name}--{job['vl_name']}--"
+                                         f"{job['direction_name']}--{tag}--{frame:04d}")
+                normal_node.file_output_items[0].name = ""
+                normal_node.format.file_format = "PNG"
 
         try:
             scene.render.filepath = out_path
@@ -1055,7 +1073,9 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         finally:
             if normal_node:
                 normal_node.directory = orig_normal_directory
+                normal_node.file_name = orig_normal_file_name
                 normal_node.file_output_items[0].name = orig_normal_item_name
+                normal_node.format.file_format = orig_normal_fmt
             scene.render.filepath = orig_filepath
             fmt.media_type = orig_media_type
             fmt.file_format = orig_file_format
@@ -1126,14 +1146,16 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             f"Sheets: {packed}  Skipped: {pack_skipped}  Errors: {pack_errors}",
         ]
 
-        if settings.render_normals and os.path.isdir(self._normal_export_root):
+        if settings.render_normals:
+            normal_tag = settings.normal_tag.replace("-", "").strip()
             _log("=== SpriteLoom: Packing normal map sprites ===")
             n_packed, n_skipped, n_errors = _run_pack(
-                self._normal_export_root, self._normal_spritesheet_root,
+                self._export_root, self._spritesheet_root,
                 settings.sheet_name_format,
                 settings.split_by_action, settings.split_by_layer, settings.split_by_direction,
                 settings.row_split_by_action, settings.row_split_by_layer, settings.row_split_by_direction,
                 settings.renumber_frames, settings.frame_num_padding,
+                frame_tag=normal_tag,
             )
             _log(f"=== Normal pack complete — {n_packed} generated, {n_skipped} skipped, {n_errors} errors ===")
             total_errors += n_errors
@@ -1277,7 +1299,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.prop(settings, "spritesheet_root")
             box.prop(settings, "clean_output")
             box.prop(settings, "overwrite_frames")
-            box.prop(settings, "render_normals")
+            row = box.row()
+            row.prop(settings, "render_normals")
+            if settings.render_normals:
+                row.prop(settings, "normal_tag", text="Tag")
 
         # --- Sheet Layout ---
         box = layout.box()
@@ -1372,9 +1397,9 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
 
         if settings.render_normals:
             if not scene.use_nodes or scene.compositing_node_group is None:
-                issues.append(("ERROR", "Normal map export requires compositor nodes — enable Use Nodes in the compositor"))
+                issues.append(("ERROR", "Normal maps require compositor nodes — enable 'Use Nodes' in the compositor"))
             elif _find_normal_output_node(scene.compositing_node_group) is None:
-                issues.append(("ERROR", "Normal map export requires a File Output node named \"Normal Output\" in the compositor"))
+                issues.append(("ERROR", f"Normal maps require a File Output compositor node named \"{_NORMAL_OUTPUT_NODE_NAME}\""))
 
         if bpy.data.filepath:
             cloth_combos = _get_cloth_combos(context)

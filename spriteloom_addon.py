@@ -314,31 +314,109 @@ def _get_cloth_objects_in_layer(view_layer):
     ]
 
 
-def _bake_cloth_for_layer_action(context, view_layer, action, warmup_frames):
+def _cloth_cache_path(obj_name, vl_name, action_name):
+    """Return the //-relative disk cache path for a (cloth_obj, view_layer, action) combo."""
+    def _safe(s):
+        return s.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return f"//cache/spriteloom/{_safe(obj_name)}/{_safe(vl_name)}__{_safe(action_name)}/"
+
+
+def _is_combo_baked(obj_name, vl_name, action_name):
+    """Return True if at least one .bphys file exists in the cache directory for this combo."""
+    if not bpy.data.filepath:
+        return False
+    rel_path = _cloth_cache_path(obj_name, vl_name, action_name)
+    abs_path = bpy.path.abspath(rel_path)
+    if not os.path.isdir(abs_path):
+        return False
+    return any(f.endswith('.bphys') for f in os.listdir(abs_path))
+
+
+def _get_cloth_combos(context):
     """
-    Bake cloth for a single (view_layer, action) combination.
-    Sets the view layer active so cloth objects are correctly resolved.
-    Returns number of objects baked.
+    Return list of (cloth_obj, view_layer, action) for all active combos
+    given the current SpriteLoom settings.
+    For COMPOSITE mode, uses only the current window view layer.
+    """
+    scene = context.scene
+    settings = scene.spriteloom
+    excluded_actions = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
+    actions = [a for a in bpy.data.actions if a.name not in excluded_actions]
+
+    if settings.output_mode == "COMPOSITE":
+        view_layers = [context.window.view_layer]
+    else:
+        view_layers = _resolve_view_layers(scene, settings.view_layers_filter)
+
+    combos = []
+    for vl in view_layers:
+        for obj in _get_cloth_objects_in_layer(vl):
+            for action in actions:
+                combos.append((obj, vl, action))
+    return combos
+
+
+def _activate_cloth_paths(view_layer, action):
+    """
+    For each cloth object in view_layer, redirect mod.point_cache.filepath to
+    the pre-baked cache for this (view_layer, action) combo.
+    Returns a dict mapping (obj_name, mod_name) -> (orig_filepath, orig_use_disk_cache)
+    for later restore. Returns empty dict if view_layer is None (composite mode).
+    """
+    saved = {}
+    if view_layer is None:
+        return saved
+    for obj in _get_cloth_objects_in_layer(view_layer):
+        for mod in obj.modifiers:
+            if mod.type != 'CLOTH':
+                continue
+            saved[(obj.name, mod.name)] = (mod.point_cache.filepath, mod.point_cache.use_disk_cache)
+            mod.point_cache.use_disk_cache = True
+            mod.point_cache.filepath = _cloth_cache_path(obj.name, view_layer.name, action.name)
+    return saved
+
+
+def _restore_cloth_paths(saved):
+    """Restore cloth modifier filepaths from a dict returned by _activate_cloth_paths."""
+    for obj in bpy.data.objects:
+        for mod in obj.modifiers:
+            if mod.type != 'CLOTH':
+                continue
+            key = (obj.name, mod.name)
+            if key in saved:
+                orig_path, orig_use_disk = saved[key]
+                mod.point_cache.filepath = orig_path
+                mod.point_cache.use_disk_cache = orig_use_disk
+
+
+def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames):
+    """
+    Bake cloth for a single (obj, view_layer, action) combination.
+    Sets use_disk_cache=True and filepath to the canonical cache path before baking.
+    NOTE: ptcache.bake(bake=True) is a blocking call — it runs the full simulation
+    before returning. Progress is updated before this call so the user sees which
+    combo is being processed.
     """
     context.window.view_layer = view_layer
 
     bake_start = int(action.frame_range[0]) - warmup_frames
     bake_end   = int(action.frame_range[1])
-    _log(f"  Cloth bake '{action.name}' / '{view_layer.name}': frames {bake_start}→{bake_end} (warmup: {warmup_frames})")
+    _log(f"  Cloth bake '{obj.name}' / '{view_layer.name}' / '{action.name}': frames {bake_start}→{bake_end}")
 
-    cloth_objs = _get_cloth_objects_in_layer(view_layer)
-    for obj in cloth_objs:
-        for mod in obj.modifiers:
-            if mod.type != 'CLOTH':
-                continue
-            mod.point_cache.frame_start = bake_start
-            mod.point_cache.frame_end   = bake_end
-            with context.temp_override(point_cache=mod.point_cache):
-                bpy.ops.ptcache.free_bake()
-                bpy.ops.ptcache.bake(bake=True)
-        _log(f"    Baked '{obj.name}'")
-
-    return len(cloth_objs)
+    for mod in obj.modifiers:
+        if mod.type != 'CLOTH':
+            continue
+        cache_path = _cloth_cache_path(obj.name, view_layer.name, action.name)
+        abs_path = bpy.path.abspath(cache_path)
+        os.makedirs(abs_path, exist_ok=True)
+        mod.point_cache.use_disk_cache = True
+        mod.point_cache.filepath = cache_path
+        mod.point_cache.frame_start = bake_start
+        mod.point_cache.frame_end   = bake_end
+        with context.temp_override(point_cache=mod.point_cache):
+            bpy.ops.ptcache.free_bake()
+            bpy.ops.ptcache.bake(bake=True)
+    _log(f"    Baked '{obj.name}'")
 
 
 _NORMAL_OUTPUT_NODE_NAME = "Normal Output"
@@ -405,10 +483,9 @@ def _build_job_queue(context, export_root):
         loop_end = frame_end if action.use_cyclic else frame_end + 1
         frames = list(range(frame_start, loop_end, frame_step))
         expected_frames = len(frames)
-        action_has_jobs = False
         action_jobs = []
         os.makedirs(export_root, exist_ok=True)
-        for layer_name, _ in layer_iter:
+        for layer_name, vl_obj in layer_iter:
             for direction_name, angle_radians in directions:
                 prefix = f"{action.name}--{layer_name}--{direction_name}--"
                 if not overwrite and _count_existing_frames(export_root, action.name, layer_name, direction_name) >= expected_frames:
@@ -420,12 +497,12 @@ def _build_job_queue(context, export_root):
                         if f.startswith(prefix) and f.lower().endswith(".png"):
                             os.remove(os.path.join(export_root, f))
                     _log(f"  CLEAR {action.name}/{layer_name}/{direction_name}")
-                action_has_jobs = True
                 for frame in frames:
                     action_jobs.append({
                         "type": "render",
                         "action": action,
                         "vl_name": layer_name,
+                        "vl_object": vl_obj,
                         "composite_mode": composite_mode,
                         "direction_name": direction_name,
                         "angle_radians": angle_radians,
@@ -436,9 +513,6 @@ def _build_job_queue(context, export_root):
                         "armature_obj": armature_obj,
                         "camera_rig": camera_rig,
                     })
-        if action_has_jobs and not composite_mode and settings.bake_cloth:
-            for layer_name, _ in layer_iter:
-                jobs.append({"type": "bake", "action": action, "vl_name": layer_name})
         jobs.extend(action_jobs)
     return jobs, skipped
 
@@ -497,10 +571,15 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         description="Comma-separated view layers to render. Leave blank to render all",
         default="",
     )
-    bake_cloth: bpy.props.BoolProperty(  # type: ignore
-        name="Bake Cloth",
-        description="Bake cloth simulations before rendering",
+    rebake_on_render: bpy.props.BoolProperty(  # type: ignore
+        name="Rebake on Render",
+        description="Automatically rebake all cloth combos before each render run",
         default=False,
+    )
+    show_cloth: bpy.props.BoolProperty(  # type: ignore
+        name="Cloth Simulation",
+        description="Show/hide the Cloth Simulation section",
+        default=True,
     )
     cloth_warmup_frames: bpy.props.IntProperty(  # type: ignore
         name="Warmup Frames",
@@ -570,6 +649,8 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
     show_scene_setup: bpy.props.BoolProperty(default=True)  # type: ignore
     show_output: bpy.props.BoolProperty(default=True)  # type: ignore
     show_sheet_layout: bpy.props.BoolProperty(default=True)  # type: ignore
+    show_preview: bpy.props.BoolProperty(default=True)  # type: ignore
+    show_render: bpy.props.BoolProperty(default=True)  # type: ignore
     progress: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})  # type: ignore
     progress_factor: bpy.props.FloatProperty(default=0.0, options={'SKIP_SAVE'})  # type: ignore
     last_result: bpy.props.StringProperty(default="")  # type: ignore
@@ -595,6 +676,162 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
 
 
 # ---------------------------------------------------------------------------
+# Cloth Bake Operators
+# ---------------------------------------------------------------------------
+
+class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
+    """Bake cloth simulations to named disk caches for use during rendering"""
+
+    bl_idname = "spriteloom.bake_cloth"
+    bl_label = "Bake Cloth"
+    bl_options = {"REGISTER"}
+
+    mode: bpy.props.StringProperty(default="missing")  # type: ignore  # "missing", "all", "single"
+    obj_name: bpy.props.StringProperty(default="")  # type: ignore
+    vl_name: bpy.props.StringProperty(default="")  # type: ignore
+    action_name: bpy.props.StringProperty(default="")  # type: ignore
+
+    _timer = None
+    _jobs = []
+    _job_index = 0
+    _orig_action = None
+    _orig_window_vl = None
+
+    def execute(self, context):
+        settings = context.scene.spriteloom
+
+        if not bpy.data.filepath:
+            self.report({"ERROR"}, "Save the .blend file first — cloth caches are stored relative to it")
+            return {"CANCELLED"}
+
+        combos = _get_cloth_combos(context)
+        if self.mode == "single":
+            combos = [
+                (obj, vl, a) for obj, vl, a in combos
+                if obj.name == self.obj_name and vl.name == self.vl_name and a.name == self.action_name
+            ]
+        elif self.mode == "missing":
+            combos = [
+                (obj, vl, a) for obj, vl, a in combos
+                if not _is_combo_baked(obj.name, vl.name, a.name)
+            ]
+        # "all" uses all combos unfiltered
+
+        if not combos:
+            self.report({"INFO"}, "Nothing to bake — all combos already baked")
+            for area in context.screen.areas:
+                area.tag_redraw()
+            return {"FINISHED"}
+
+        armature = settings.armature
+        self._orig_action = armature.animation_data.action if (armature and armature.animation_data) else None
+        self._orig_window_vl = context.window.view_layer
+        self._jobs = combos
+        self._job_index = 0
+        settings.progress = f"Baking cloth (0/{len(combos)})…"
+        settings.progress_factor = 0.0
+
+        self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        if event.type == "ESC":
+            return self._finish(context, cancelled=True)
+
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+
+        if self._job_index >= len(self._jobs):
+            return self._finish(context)
+
+        obj, vl, action = self._jobs[self._job_index]
+        settings = context.scene.spriteloom
+        total = len(self._jobs)
+        settings.progress = f"Baking: {obj.name} / {vl.name} / {action.name} ({self._job_index + 1}/{total})"
+        settings.progress_factor = self._job_index / total
+
+        armature = settings.armature
+        if armature:
+            if armature.animation_data is None:
+                armature.animation_data_create()
+            armature.animation_data.action = action
+
+        # NOTE: ptcache.bake(bake=True) is a blocking call — UI is unresponsive
+        # during each simulation, which can take seconds to minutes.
+        _log(f"=== BakeCloth: '{obj.name}' / '{vl.name}' / '{action.name}' ===")
+        _bake_cloth_for_combo(context, obj, vl, action, settings.cloth_warmup_frames)
+        _log(f"=== BakeCloth done ===")
+
+        self._job_index += 1
+        return {"RUNNING_MODAL"}
+
+    def _finish(self, context, cancelled=False):
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+
+        settings = context.scene.spriteloom
+        # Restore armature action
+        armature = settings.armature
+        if armature and armature.animation_data:
+            armature.animation_data.action = self._orig_action
+        # Restore window view layer
+        if self._orig_window_vl is not None:
+            context.window.view_layer = self._orig_window_vl
+
+        done = self._job_index
+        total = len(self._jobs)
+        if cancelled:
+            settings.progress = ""
+            self.report({"INFO"}, f"Bake cancelled after {done}/{total} combos")
+        else:
+            settings.progress = ""
+            self.report({"INFO"}, f"Baked {done} cloth combo(s)")
+
+        settings.progress_factor = 0.0
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        return {"FINISHED"}
+
+
+class SPRITELOOM_OT_DeleteBakes(bpy.types.Operator):
+    """Delete all SpriteLoom cloth cache files"""
+
+    bl_idname = "spriteloom.delete_bakes"
+    bl_label = "Delete Cloth Bakes"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        if not bpy.data.filepath:
+            self.report({"WARNING"}, "No .blend file saved — nothing to delete")
+            return {"CANCELLED"}
+
+        combos = _get_cloth_combos(context)
+        deleted_files = 0
+        deleted_dirs = 0
+        for obj, vl, action in combos:
+            path = bpy.path.abspath(_cloth_cache_path(obj.name, vl.name, action.name))
+            if os.path.isdir(path):
+                for f in os.listdir(path):
+                    if f.endswith('.bphys') or f.endswith('.bobj.gz'):
+                        os.remove(os.path.join(path, f))
+                        deleted_files += 1
+                if not os.listdir(path):
+                    os.rmdir(path)
+                    deleted_dirs += 1
+
+        self.report({"INFO"}, f"Deleted {deleted_files} cache file(s) from {deleted_dirs} director(ies)")
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
 # Operator
 # ---------------------------------------------------------------------------
 
@@ -616,6 +853,8 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
     _spritesheet_root = ""
     _normal_export_root = ""
     _normal_spritesheet_root = ""
+    _active_cloth_paths = {}
+    _last_cloth_combo = None
 
     def execute(self, context):
         settings = context.scene.spriteloom
@@ -641,6 +880,22 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     removed += 1
             _log(f"Clean: removed {removed} file(s) from {self._export_root}")
 
+        if settings.rebake_on_render:
+            combos = _get_cloth_combos(context)
+            orig_action = settings.armature.animation_data.action if (settings.armature and settings.armature.animation_data) else None
+            orig_vl = context.window.view_layer
+            for i, (obj, vl, action) in enumerate(combos):
+                settings.progress = f"Baking cloth ({i + 1}/{len(combos)})…"
+                settings.progress_factor = (i + 1) / max(len(combos), 1)
+                for area in context.screen.areas:
+                    area.tag_redraw()
+                _bake_cloth_for_combo(context, obj, vl, action, settings.cloth_warmup_frames)
+            if settings.armature and settings.armature.animation_data:
+                settings.armature.animation_data.action = orig_action
+            context.window.view_layer = orig_vl
+            settings.progress = ""
+            settings.progress_factor = 0.0
+
         jobs, result = _build_job_queue(context, self._export_root)
         if jobs is None:
             self.report({"ERROR"}, result)
@@ -654,6 +909,8 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         self._errors = 0
         self._orig_frame = context.scene.frame_current
         self._orig_camera_rig_z = settings.camera_rig.rotation_euler.z if settings.camera_rig else None
+        self._active_cloth_paths = {}
+        self._last_cloth_combo = None
 
         if not jobs:
             _log("Nothing to render — all jobs skipped.")
@@ -686,17 +943,16 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         if job["type"] == "bake":
             action = job["action"]
             settings = context.scene.spriteloom
-            context.scene.spriteloom.progress = f"Baking cloth: {action.name}..."
-            for area in context.screen.areas:
-                area.tag_redraw()
-            _log(f"=== Baking cloth for '{action.name}' ===")
+            context.scene.spriteloom.progress = f"Baking cloth: {action.name} / {job['vl_name']}…"
+            _log(f"=== Cloth rebake on render: '{action.name}' / '{job['vl_name']}' ===")
             armature_obj = settings.armature
             if armature_obj and armature_obj.animation_data:
                 armature_obj.animation_data.action = action
-            view_layer = context.scene.view_layers.get(job["vl_name"])
-            if view_layer:
-                _bake_cloth_for_layer_action(context, view_layer, action, settings.cloth_warmup_frames)
-            _log(f"=== Cloth bake done ===")
+            vl_obj = job.get("vl_object") or context.scene.view_layers.get(job["vl_name"])
+            if vl_obj:
+                for obj in _get_cloth_objects_in_layer(vl_obj):
+                    _bake_cloth_for_combo(context, obj, vl_obj, action, settings.cloth_warmup_frames)
+            _log(f"=== Cloth rebake done ===")
             self._job_index += 1
             return {"RUNNING_MODAL"}
 
@@ -708,6 +964,13 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         frame = job["frame"]
         frame_num = frame - job["frame_start"] + 1
         frame_total = job["frame_end"] - job["frame_start"] + 1
+
+        # Activate pre-baked cloth cache paths when the (vl, action) combo changes
+        combo_key = (job["vl_name"], action.name)
+        if combo_key != self._last_cloth_combo:
+            _restore_cloth_paths(self._active_cloth_paths)
+            self._active_cloth_paths = _activate_cloth_paths(job.get("vl_object"), action)
+            self._last_cloth_combo = combo_key
 
         label = f"{action.name} / {job['vl_name']} / {job['direction_name']}"
         scene.spriteloom.progress = (
@@ -816,6 +1079,9 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         settings = context.scene.spriteloom
         if settings.camera_rig and self._orig_camera_rig_z is not None:
             settings.camera_rig.rotation_euler.z = self._orig_camera_rig_z
+        _restore_cloth_paths(self._active_cloth_paths)
+        self._active_cloth_paths = {}
+        self._last_cloth_combo = None
 
     def cancel(self, context):
         _log("=== SpriteLoom: Cancelled ===")
@@ -938,15 +1204,45 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                         warn.label(text="", icon='ERROR')
             else:
                 actions_box.label(text="No actions in file", icon='INFO')
-            if settings.output_mode == "LAYERED":
-                row = box.row(align=True)
-                row.prop(settings, "bake_cloth")
-                if settings.bake_cloth:
-                    row.prop(settings, "cloth_warmup_frames")
+        # --- Cloth Simulation ---
+        box = layout.box()
+        row = box.row()
+        row.prop(settings, "show_cloth",
+                 icon="TRIA_DOWN" if settings.show_cloth else "TRIA_RIGHT",
+                 emboss=False, text="Cloth Simulation", icon_only=False)
+        row.label(icon="MOD_CLOTH")
+        if settings.show_cloth:
+            box.prop(settings, "cloth_warmup_frames")
+            combos = _get_cloth_combos(context)
+            if not combos:
+                box.label(text="No cloth objects in active view layers", icon='INFO')
             else:
-                row = box.row()
-                row.enabled = False
-                row.label(text="Cloth bake unavailable in Composite mode (layers are merged by the compositor)", icon='INFO')
+                col = box.column(align=True)
+                col.scale_y = 0.8
+                MAX_ROWS = 10
+                for obj, vl, action in combos[:MAX_ROWS]:
+                    baked = _is_combo_baked(obj.name, vl.name, action.name)
+                    row = col.row(align=True)
+                    row.label(
+                        text=f"{obj.name}  /  {vl.name}  /  {action.name}",
+                        icon='CHECKMARK' if baked else 'BLANK1',
+                    )
+                    op = row.operator("spriteloom.bake_cloth", text="", icon='MOD_CLOTH', emboss=False)
+                    op.mode = "single"
+                    op.obj_name = obj.name
+                    op.vl_name = vl.name
+                    op.action_name = action.name
+                if len(combos) > MAX_ROWS:
+                    col.label(text=f"+{len(combos) - MAX_ROWS} more…", icon='BLANK1')
+                row = box.row(align=True)
+                op = row.operator("spriteloom.bake_cloth", text="Bake Missing", icon='MOD_CLOTH')
+                op.mode = "missing"
+                op = row.operator("spriteloom.bake_cloth", text="Rebake All", icon='FILE_REFRESH')
+                op.mode = "all"
+                row.operator("spriteloom.delete_bakes", text="Delete All", icon='TRASH')
+                box.prop(settings, "rebake_on_render")
+            if settings.progress and "Baking" in settings.progress:
+                box.progress(factor=settings.progress_factor, type="BAR", text=settings.progress)
 
         # --- Output Paths ---
         box = layout.box()
@@ -1080,83 +1376,100 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             elif _find_normal_output_node(scene.compositing_node_group) is None:
                 issues.append(("ERROR", "Normal map export requires a File Output node named \"Normal Output\" in the compositor"))
 
+        if bpy.data.filepath:
+            cloth_combos = _get_cloth_combos(context)
+            if cloth_combos:
+                missing_count = sum(
+                    1 for obj, vl, a in cloth_combos
+                    if not _is_combo_baked(obj.name, vl.name, a.name)
+                )
+                if missing_count:
+                    if settings.rebake_on_render:
+                        issues.append(("INFO", f"Cloth: {missing_count} combo(s) will be baked before render"))
+                    else:
+                        issues.append(("ERROR", f"Cloth: {missing_count} combo(s) not baked — simulation plays live"))
+
         # --- Preview box ---
         layout.separator()
         vp_box = layout.box()
-        vp_col = vp_box.column(align=True)
-        vp_col.label(text="Preview", icon="RENDER_ANIMATION")
+        vp_hdr = vp_box.row()
+        vp_hdr.prop(settings, "show_preview",
+                    icon="TRIA_DOWN" if settings.show_preview else "TRIA_RIGHT",
+                    emboss=False, text="Preview", icon_only=False)
+        vp_hdr.label(icon="RENDER_ANIMATION")
 
-        # Camera direction group
-        if settings.camera_rig:
-            import math as _math
-            dir_box = vp_box.box()
-            dir_box.label(text="Camera Direction", icon="ORIENTATION_VIEW")
-            directions = _get_directions(settings.num_directions)
-            cols = min(len(directions), 4)
-            grid = dir_box.grid_flow(row_major=True, columns=cols, even_columns=True, even_rows=False, align=True)
-            for name, angle in directions:
-                op = grid.operator("spriteloom.preview_direction", text=name)
-                op.angle = angle
-                op.label = name
-            saved = settings.camera_rig_saved_rotation
-            reset_row = dir_box.row()
-            reset_row.enabled = not _math.isnan(saved)
-            reset_row.operator("spriteloom.reset_camera_direction", text="Reset Camera", icon="LOOP_BACK")
+        if settings.show_preview:
+            # Camera direction group
+            if settings.camera_rig:
+                import math as _math
+                dir_box = vp_box.box()
+                dir_box.label(text="Camera Direction", icon="ORIENTATION_VIEW")
+                directions = _get_directions(settings.num_directions)
+                cols = min(len(directions), 4)
+                grid = dir_box.grid_flow(row_major=True, columns=cols, even_columns=True, even_rows=False, align=True)
+                for name, angle in directions:
+                    op = grid.operator("spriteloom.preview_direction", text=name)
+                    op.angle = angle
+                    op.label = name
+                saved = settings.camera_rig_saved_rotation
+                reset_row = dir_box.row()
+                reset_row.enabled = not _math.isnan(saved)
+                reset_row.operator("spriteloom.reset_camera_direction", text="Reset Camera", icon="LOOP_BACK")
 
-        vp_armature = settings.armature
-        vp_action = (
-            vp_armature.animation_data.action
-            if vp_armature and vp_armature.animation_data
-            else None
-        )
-        vp_col = vp_box.column(align=True)
-        if vp_action:
-            vp_col.label(text=f"Action: {vp_action.name}", icon="ACTION")
-            vp_col.label(
-                text=f"Frames: {int(vp_action.frame_range[0])}–{int(vp_action.frame_range[1])}",
-                icon="TIME",
+            vp_armature = settings.armature
+            vp_action = (
+                vp_armature.animation_data.action
+                if vp_armature and vp_armature.animation_data
+                else None
             )
-        else:
-            vp_col.label(text="Action: (none active on armature)", icon="ERROR")
+            vp_col = vp_box.column(align=True)
+            if vp_action:
+                vp_col.label(text=f"Action: {vp_action.name}", icon="ACTION")
+                vp_col.label(
+                    text=f"Frames: {int(vp_action.frame_range[0])}–{int(vp_action.frame_range[1])}",
+                    icon="TIME",
+                )
+            else:
+                vp_col.label(text="Action: (none active on armature)", icon="ERROR")
 
-        if settings.camera_rig:
-            dir_label = _get_direction_label(settings.camera_rig.rotation_euler.z)
-            vp_col.label(text=f"Direction: {dir_label}", icon="ORIENTATION_VIEW")
-        else:
-            vp_col.label(text="Direction: (no camera rig)", icon="ERROR")
+            if settings.camera_rig:
+                dir_label = _get_direction_label(settings.camera_rig.rotation_euler.z)
+                vp_col.label(text=f"Direction: {dir_label}", icon="ORIENTATION_VIEW")
+            else:
+                vp_col.label(text="Direction: (no camera rig)", icon="ERROR")
 
-        if settings.bake_cloth:
-            vp_col.label(
-                text=f"Cloth bake: yes (warmup {settings.cloth_warmup_frames} frames)",
-                icon="MOD_CLOTH",
-            )
-
-        vp_row = vp_box.row()
-        vp_row.enabled = vp_action is not None
-        vp_row.operator("spriteloom.render_video_preview", icon="RENDER_ANIMATION")
+            vp_row = vp_box.row()
+            vp_row.enabled = vp_action is not None
+            vp_row.operator("spriteloom.render_video_preview", icon="RENDER_ANIMATION")
 
         # --- Render box ---
         layout.separator()
         render_box = layout.box()
-        render_col = render_box.column(align=True)
-        render_col.label(text="Render", icon="RENDERLAYERS")
+        render_hdr = render_box.row()
+        render_hdr.prop(settings, "show_render",
+                        icon="TRIA_DOWN" if settings.show_render else "TRIA_RIGHT",
+                        emboss=False, text="Render", icon_only=False)
+        render_hdr.label(icon="RENDERLAYERS")
 
-        if issues:
-            for icon, text in issues:
-                render_col.label(text=text, icon=icon)
+        if settings.show_render:
+            render_col = render_box.column(align=True)
 
-        if settings.progress:
-            render_box.progress(factor=settings.progress_factor, type="BAR", text=settings.progress)
-            render_box.label(text="Press ESC to cancel", icon="X")
-        else:
-            blocking = any(icon == "ERROR" for icon, _ in issues)
-            row = render_box.row()
-            row.enabled = not blocking
-            row.operator("spriteloom.render_all", icon="RENDERLAYERS")
+            if issues:
+                for icon, text in issues:
+                    render_col.label(text=text, icon=icon)
 
-        if settings.last_result:
-            for line in settings.last_result.split("\n"):
-                render_col.label(text=line)
+            if settings.progress:
+                render_box.progress(factor=settings.progress_factor, type="BAR", text=settings.progress)
+                render_box.label(text="Press ESC to cancel", icon="X")
+            else:
+                blocking = any(icon == "ERROR" for icon, _ in issues)
+                row = render_box.row()
+                row.enabled = not blocking
+                row.operator("spriteloom.render_all", icon="RENDERLAYERS")
+
+            if settings.last_result:
+                for line in settings.last_result.split("\n"):
+                    render_col.label(text=line)
 
 
 # ---------------------------------------------------------------------------
@@ -1191,14 +1504,13 @@ class SPRITELOOM_OT_RenderVideoPreview(bpy.types.Operator):
         os.makedirs(preview_dir, exist_ok=True)
         video_path = os.path.join(preview_dir, f"{action.name}_preview.mp4")
 
-        # Bake cloth if needed
-        if settings.bake_cloth:
-            vls = _resolve_view_layers(scene, settings.view_layers_filter)
-            for vl in vls:
-                if _get_cloth_objects_in_layer(vl):
-                    _bake_cloth_for_layer_action(
-                        context, vl, action, settings.cloth_warmup_frames
-                    )
+        # Activate pre-baked cloth cache paths for this action
+        if settings.output_mode == "COMPOSITE":
+            vl_for_cloth = context.window.view_layer
+        else:
+            active_vls = _resolve_view_layers(scene, settings.view_layers_filter)
+            vl_for_cloth = active_vls[0] if active_vls else None
+        saved_cloth = _activate_cloth_paths(vl_for_cloth, action)
 
         # Save render state
         orig_filepath = scene.render.filepath
@@ -1221,6 +1533,7 @@ class SPRITELOOM_OT_RenderVideoPreview(bpy.types.Operator):
             scene.render.image_settings.file_format = orig_format
             scene.frame_start = orig_frame_start
             scene.frame_end = orig_frame_end
+            _restore_cloth_paths(saved_cloth)
 
         if os.path.exists(video_path):
             if sys.platform == "win32":
@@ -1372,6 +1685,8 @@ _classes = (
     SPRITELOOM_OT_ToggleViewLayer,
     SPRITELOOM_OT_PreviewDirection,
     SPRITELOOM_OT_ResetCameraDirection,
+    SPRITELOOM_OT_BakeCloth,
+    SPRITELOOM_OT_DeleteBakes,
     SPRITELOOM_PT_Main,
 )
 

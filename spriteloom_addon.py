@@ -325,22 +325,77 @@ def _get_cloth_objects_in_layer(view_layer):
     ]
 
 
-def _cloth_cache_path(obj_name, vl_name, action_name):
-    """Return the //-relative disk cache path for a (cloth_obj, view_layer, action) combo."""
+def _combo_slot_name(vl_name, action_name):
+    """Stable PointCache slot name for a (view_layer, action) combo."""
     def _safe(s):
         return s.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    return f"//cache/spriteloom/{_safe(obj_name)}/{_safe(vl_name)}__{_safe(action_name)}/"
+    return f"{_safe(vl_name)}__{_safe(action_name)}"
 
 
-def _is_combo_baked(obj_name, vl_name, action_name):
-    """Return True if at least one .bphys file exists in the cache directory for this combo."""
+def _find_combo_slot(mod, slot_name):
+    """Return (index, slot) for the named PointCache slot, or (None, None) if not found."""
+    pcs = mod.point_cache.point_caches
+    for i, s in enumerate(pcs):
+        if s.name == slot_name:
+            return i, s
+    return None, None
+
+
+def _ensure_combo_slot(mod, slot_name):
+    """
+    Return the PointCache slot for this combo, creating it via ptcache.add() if needed.
+    Uses the default blendcache disk cache (use_external=False) — the slot name becomes
+    the filename prefix so each combo's files coexist without conflict.
+    """
+    _, slot = _find_combo_slot(mod, slot_name)
+    if slot is not None:
+        return slot
+
+    # ptcache.add() creates a new slot and makes it the active one
+    with bpy.context.temp_override(active_object=mod.id_data, point_cache=mod.point_cache):
+        bpy.ops.ptcache.add()
+
+    new_slot = mod.point_cache
+    new_slot.name = slot_name
+    new_slot.use_disk_cache = True
+    new_slot.use_external = False
+    return new_slot
+
+
+def _activate_combo_slot(mod, slot_name):
+    """
+    Make the named PointCache slot the active one on mod.
+    If the currently-active slot is_baked, free_bakes it first (files on disk are preserved)
+    to allow switching. Returns True on success.
+    """
+    target_idx, _ = _find_combo_slot(mod, slot_name)
+    if target_idx is None:
+        return False
+
+    current = mod.point_cache
+    if current.name == slot_name:
+        return True  # already active
+
+    mod.point_cache.point_caches.active_index = target_idx
+    return True
+
+
+def _blend_cache_dir():
+    """Return the path to the default blendcache directory, or None if blend is unsaved."""
     if not bpy.data.filepath:
+        return None
+    blend_dir = os.path.dirname(bpy.data.filepath)
+    blend_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+    return os.path.join(blend_dir, f"blendcache_{blend_name}")
+
+
+def _is_combo_baked(vl_name, action_name):
+    """Return True if .bphys files exist in the blendcache dir for this combo's slot name."""
+    cache_dir = _blend_cache_dir()
+    if not cache_dir or not os.path.isdir(cache_dir):
         return False
-    rel_path = _cloth_cache_path(obj_name, vl_name, action_name)
-    abs_path = bpy.path.abspath(rel_path)
-    if not os.path.isdir(abs_path):
-        return False
-    return any(f.endswith('.bphys') for f in os.listdir(abs_path))
+    prefix = _combo_slot_name(vl_name, action_name) + "_"
+    return any(f.startswith(prefix) and f.endswith('.bphys') for f in os.listdir(cache_dir))
 
 
 def _get_cloth_combos(context):
@@ -367,66 +422,121 @@ def _get_cloth_combos(context):
     return combos
 
 
-def _activate_cloth_paths(view_layer, action):
+def _activate_cloth_paths(view_layer, action, context=None):
     """
-    For each cloth object in view_layer, redirect mod.point_cache.filepath to
-    the pre-baked cache for this (view_layer, action) combo.
-    Returns a dict mapping (obj_name, mod_name) -> (orig_filepath, orig_use_disk_cache)
-    for later restore. Returns empty dict if view_layer is None (composite mode).
+    For each cloth object in view_layer, switch mod's active PointCache slot to the
+    one dedicated to this (view_layer, action) combo.
+    Returns a dict mapping (obj_name, mod_name) -> prev_slot_name for later restore.
+
+    In composite mode (view_layer is None), scans all scene view layers to find
+    which one holds the baked files for this action.
     """
+    if context is None:
+        context = bpy.context
     saved = {}
     if view_layer is None:
+        # Composite mode: scan all view layers to find which one has the bake.
+        scene = bpy.context.scene
+        claimed = set()
+        all_cloth_keys = set()
+        for vl in scene.view_layers:
+            for obj in _get_cloth_objects_in_layer(vl):
+                for mod in obj.modifiers:
+                    if mod.type != 'CLOTH':
+                        continue
+                    key = (obj.name, mod.name)
+                    all_cloth_keys.add(key)
+                    if key in claimed:
+                        continue
+                    if _is_combo_baked(vl.name, action.name):
+                        claimed.add(key)
+                        saved[key] = mod.point_cache.name
+                        slot_name = _combo_slot_name(vl.name, action.name)
+                        if _activate_combo_slot(mod, slot_name):
+                            _log(f"  [cloth] slot activated: {obj.name}/{mod.name} -> '{slot_name}' (composite vl={vl.name})")
+                        else:
+                            _log(f"  [cloth] ERROR: slot '{slot_name}' not found for {obj.name}/{mod.name} (composite)")
+        for key in all_cloth_keys - claimed:
+            _log(f"  [cloth] ERROR: no baked cache found for {key[0]}/{key[1]} action={action.name} — cloth will not simulate correctly")
         return saved
     for obj in _get_cloth_objects_in_layer(view_layer):
         for mod in obj.modifiers:
             if mod.type != 'CLOTH':
                 continue
-            saved[(obj.name, mod.name)] = (mod.point_cache.filepath, mod.point_cache.use_disk_cache)
-            mod.point_cache.use_disk_cache = True
-            mod.point_cache.filepath = _cloth_cache_path(obj.name, view_layer.name, action.name)
+            key = (obj.name, mod.name)
+            if not _is_combo_baked(view_layer.name, action.name):
+                _log(f"  [cloth] ERROR: no baked cache found for {obj.name}/{mod.name} vl={view_layer.name} action={action.name} — cloth will not simulate correctly")
+            saved[key] = mod.point_cache.name
+            slot_name = _combo_slot_name(view_layer.name, action.name)
+            if _activate_combo_slot(mod, slot_name):
+                _log(f"  [cloth] slot activated: {obj.name}/{mod.name} -> '{slot_name}'")
+            else:
+                _log(f"  [cloth] ERROR: slot '{slot_name}' not found for {obj.name}/{mod.name}")
     return saved
 
 
-def _restore_cloth_paths(saved):
-    """Restore cloth modifier filepaths from a dict returned by _activate_cloth_paths."""
+def _restore_cloth_paths(saved, context=None):
+    """Switch each cloth modifier back to its previously-active PointCache slot."""
+    if context is None:
+        context = bpy.context
     for obj in bpy.data.objects:
         for mod in obj.modifiers:
             if mod.type != 'CLOTH':
                 continue
             key = (obj.name, mod.name)
-            if key in saved:
-                orig_path, orig_use_disk = saved[key]
-                mod.point_cache.filepath = orig_path
-                mod.point_cache.use_disk_cache = orig_use_disk
+            if key in saved and saved[key]:
+                _activate_combo_slot(mod, saved[key])
 
 
 def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames):
     """
-    Bake cloth for a single (obj, view_layer, action) combination.
-    Sets use_disk_cache=True and filepath to the canonical cache path before baking.
+    Bake cloth for a single (obj, view_layer, action) combination using a dedicated
+    PointCache slot. Each combo gets its own slot with a fixed filepath — switching
+    between slots never changes any slot's filepath, so files for other combos are
+    never deleted.
     NOTE: ptcache.bake(bake=True) is a blocking call — it runs the full simulation
     before returning. Progress is updated before this call so the user sees which
     combo is being processed.
     """
     context.window.view_layer = view_layer
 
+    armature = context.scene.spriteloom.armature
+    if armature:
+        if armature.animation_data is None:
+            armature.animation_data_create()
+        armature.animation_data.action = action
+
     bake_start = int(action.frame_range[0]) - warmup_frames
     bake_end   = int(action.frame_range[1])
     _log(f"  Cloth bake '{obj.name}' / '{view_layer.name}' / '{action.name}': frames {bake_start}→{bake_end}")
 
+    slot_name = _combo_slot_name(view_layer.name, action.name)
+
+
     for mod in obj.modifiers:
         if mod.type != 'CLOTH':
             continue
-        cache_path = _cloth_cache_path(obj.name, view_layer.name, action.name)
-        abs_path = bpy.path.abspath(cache_path)
-        os.makedirs(abs_path, exist_ok=True)
-        mod.point_cache.use_disk_cache = True
-        mod.point_cache.filepath = cache_path
+        # Get or create the dedicated slot for this combo.
+        _ensure_combo_slot(mod, slot_name)
+        _activate_combo_slot(mod, slot_name)
+
+        # If the slot was previously baked, free it before re-baking.
+        if mod.point_cache.is_baked:
+            with context.temp_override(active_object=obj, point_cache=mod.point_cache):
+                bpy.ops.ptcache.free_bake()
+
         mod.point_cache.frame_start = bake_start
         mod.point_cache.frame_end   = bake_end
-        with context.temp_override(point_cache=mod.point_cache):
-            bpy.ops.ptcache.free_bake()
+        with context.temp_override(active_object=obj, point_cache=mod.point_cache):
             bpy.ops.ptcache.bake(bake=True)
+
+        cache_dir = _blend_cache_dir()
+        prefix = slot_name + "_"
+        written = [f for f in os.listdir(cache_dir) if f.startswith(prefix) and f.endswith('.bphys')] if cache_dir and os.path.isdir(cache_dir) else []
+        if written:
+            _log(f"    Verified: {len(written)} .bphys files for slot '{slot_name}'")
+        else:
+            _log(f"    ERROR: no .bphys files found for slot '{slot_name}' in {cache_dir}")
     _log(f"    Baked '{obj.name}'")
 
 
@@ -729,7 +839,7 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
         elif self.mode == "missing":
             combos = [
                 (obj, vl, a) for obj, vl, a in combos
-                if not _is_combo_baked(obj.name, vl.name, a.name)
+                if not _is_combo_baked(vl.name, a.name)
             ]
         # "all" uses all combos unfiltered
 
@@ -769,12 +879,6 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
         total = len(self._jobs)
         settings.progress = f"Baking: {obj.name} / {vl.name} / {action.name} ({self._job_index + 1}/{total})"
         settings.progress_factor = self._job_index / total
-
-        armature = settings.armature
-        if armature:
-            if armature.animation_data is None:
-                armature.animation_data_create()
-            armature.animation_data.action = action
 
         # NOTE: ptcache.bake(bake=True) is a blocking call — UI is unresponsive
         # during each simulation, which can take seconds to minutes.
@@ -827,21 +931,22 @@ class SPRITELOOM_OT_DeleteBakes(bpy.types.Operator):
             self.report({"WARNING"}, "No .blend file saved — nothing to delete")
             return {"CANCELLED"}
 
+        cache_dir = _blend_cache_dir()
+        if not cache_dir or not os.path.isdir(cache_dir):
+            self.report({"WARNING"}, "No blendcache directory found — nothing to delete")
+            return {"CANCELLED"}
+
         combos = _get_cloth_combos(context)
         deleted_files = 0
-        deleted_dirs = 0
-        for obj, vl, action in combos:
-            path = bpy.path.abspath(_cloth_cache_path(obj.name, vl.name, action.name))
-            if os.path.isdir(path):
-                for f in os.listdir(path):
-                    if f.endswith('.bphys') or f.endswith('.bobj.gz'):
-                        os.remove(os.path.join(path, f))
-                        deleted_files += 1
-                if not os.listdir(path):
-                    os.rmdir(path)
-                    deleted_dirs += 1
+        for _, vl, action in combos:
+            slot_name = _combo_slot_name(vl.name, action.name)
+            prefix = slot_name + "_"
+            for f in os.listdir(cache_dir):
+                if f.startswith(prefix) and (f.endswith('.bphys') or f.endswith('.bobj.gz')):
+                    os.remove(os.path.join(cache_dir, f))
+                    deleted_files += 1
 
-        self.report({"INFO"}, f"Deleted {deleted_files} cache file(s) from {deleted_dirs} director(ies)")
+        self.report({"INFO"}, f"Deleted {deleted_files} cache file(s) from blendcache dir")
         for area in context.screen.areas:
             area.tag_redraw()
         return {"FINISHED"}
@@ -957,9 +1062,6 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             settings = context.scene.spriteloom
             context.scene.spriteloom.progress = f"Baking cloth: {action.name} / {job['vl_name']}…"
             _log(f"=== Cloth rebake on render: '{action.name}' / '{job['vl_name']}' ===")
-            armature_obj = settings.armature
-            if armature_obj and armature_obj.animation_data:
-                armature_obj.animation_data.action = action
             vl_obj = job.get("vl_object") or context.scene.view_layers.get(job["vl_name"])
             if vl_obj:
                 for obj in _get_cloth_objects_in_layer(vl_obj):
@@ -981,6 +1083,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         combo_key = (job["vl_name"], action.name)
         if combo_key != self._last_cloth_combo:
             _restore_cloth_paths(self._active_cloth_paths)
+            _log(f"[cloth] activating cache for combo: vl={job['vl_name']}, action={action.name}")
             self._active_cloth_paths = _activate_cloth_paths(job.get("vl_object"), action)
             self._last_cloth_combo = combo_key
 
@@ -1243,7 +1346,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 col.scale_y = 0.8
                 MAX_ROWS = 10
                 for obj, vl, action in combos[:MAX_ROWS]:
-                    baked = _is_combo_baked(obj.name, vl.name, action.name)
+                    baked = _is_combo_baked(vl.name, action.name)
                     row = col.row(align=True)
                     row.label(
                         text=f"{obj.name}  /  {vl.name}  /  {action.name}",
@@ -1405,8 +1508,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             cloth_combos = _get_cloth_combos(context)
             if cloth_combos:
                 missing_count = sum(
-                    1 for obj, vl, a in cloth_combos
-                    if not _is_combo_baked(obj.name, vl.name, a.name)
+                    1 for (_, vl, a) in cloth_combos
+                    if not _is_combo_baked(vl.name, a.name)
                 )
                 if missing_count:
                     if settings.rebake_on_render:

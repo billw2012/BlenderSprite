@@ -326,11 +326,14 @@ def _get_cloth_objects_in_layer(view_layer):
     ]
 
 
-def _combo_slot_name(vl_name, action_name):
-    """Stable PointCache slot name for a (view_layer, action) combo."""
+def _combo_slot_name(vl_name, action_name, direction_name=None):
+    """Stable PointCache slot name for a (view_layer, action[, direction]) combo."""
     def _safe(s):
         return s.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    return f"{_safe(vl_name)}__{_safe(action_name)}"
+    base = f"{_safe(vl_name)}__{_safe(action_name)}"
+    if direction_name is not None:
+        base = f"{base}__{_safe(direction_name)}"
+    return base
 
 
 def _find_combo_slot(mod, slot_name):
@@ -390,12 +393,12 @@ def _blend_cache_dir():
     return os.path.join(blend_dir, f"blendcache_{blend_name}")
 
 
-def _is_combo_baked(vl_name, action_name):
+def _is_combo_baked(vl_name, action_name, direction_name=None):
     """Return True if .bphys files exist in the blendcache dir for this combo's slot name."""
     cache_dir = _blend_cache_dir()
     if not cache_dir or not os.path.isdir(cache_dir):
         return False
-    prefix = _combo_slot_name(vl_name, action_name) + "_"
+    prefix = _combo_slot_name(vl_name, action_name, direction_name) + "_"
     return any(f.startswith(prefix) and f.endswith('.bphys') for f in os.listdir(cache_dir))
 
 
@@ -423,14 +426,15 @@ def _get_cloth_combos(context):
     return combos
 
 
-def _activate_cloth_paths(view_layer, action, context=None):
+def _activate_cloth_paths(view_layer, action, context=None, direction_name=None):
     """
     For each cloth object in view_layer, switch mod's active PointCache slot to the
-    one dedicated to this (view_layer, action) combo.
+    one dedicated to this (view_layer, action[, direction]) combo.
     Returns a dict mapping (obj_name, mod_name) -> prev_slot_name for later restore.
 
     In composite mode (view_layer is None), scans all scene view layers to find
     which one holds the baked files for this action.
+    direction_name is only set in OBJECT rotation mode (per-direction bakes).
     """
     if context is None:
         context = bpy.context
@@ -449,10 +453,10 @@ def _activate_cloth_paths(view_layer, action, context=None):
                     all_cloth_keys.add(key)
                     if key in claimed:
                         continue
-                    if _is_combo_baked(vl.name, action.name):
+                    if _is_combo_baked(vl.name, action.name, direction_name):
                         claimed.add(key)
                         saved[key] = mod.point_cache.name
-                        slot_name = _combo_slot_name(vl.name, action.name)
+                        slot_name = _combo_slot_name(vl.name, action.name, direction_name)
                         if _activate_combo_slot(mod, slot_name):
                             _log(f"  [cloth] slot activated: {obj.name}/{mod.name} -> '{slot_name}' (composite vl={vl.name})")
                         else:
@@ -465,10 +469,10 @@ def _activate_cloth_paths(view_layer, action, context=None):
             if mod.type != 'CLOTH':
                 continue
             key = (obj.name, mod.name)
-            if not _is_combo_baked(view_layer.name, action.name):
-                _log(f"  [cloth] ERROR: no baked cache found for {obj.name}/{mod.name} vl={view_layer.name} action={action.name} — cloth will not simulate correctly")
+            if not _is_combo_baked(view_layer.name, action.name, direction_name):
+                _log(f"  [cloth] ERROR: no baked cache found for {obj.name}/{mod.name} vl={view_layer.name} action={action.name} dir={direction_name} — cloth will not simulate correctly")
             saved[key] = mod.point_cache.name
-            slot_name = _combo_slot_name(view_layer.name, action.name)
+            slot_name = _combo_slot_name(view_layer.name, action.name, direction_name)
             if _activate_combo_slot(mod, slot_name):
                 _log(f"  [cloth] slot activated: {obj.name}/{mod.name} -> '{slot_name}'")
             else:
@@ -489,12 +493,13 @@ def _restore_cloth_paths(saved, context=None):
                 _activate_combo_slot(mod, saved[key])
 
 
-def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames):
+def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames, direction_name=None):
     """
-    Bake cloth for a single (obj, view_layer, action) combination using a dedicated
-    PointCache slot. Each combo gets its own slot with a fixed filepath — switching
-    between slots never changes any slot's filepath, so files for other combos are
-    never deleted.
+    Bake cloth for a single (obj, view_layer, action[, direction]) combination using a
+    dedicated PointCache slot. Each combo gets its own slot with a fixed filepath —
+    switching between slots never changes any slot's filepath, so files for other combos
+    are never deleted.
+    direction_name is only provided in OBJECT rotation mode (per-direction bakes).
     NOTE: ptcache.bake(bake=True) is a blocking call — it runs the full simulation
     before returning. Progress is updated before this call so the user sees which
     combo is being processed.
@@ -509,9 +514,10 @@ def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames):
 
     bake_start = int(action.frame_range[0]) - warmup_frames
     bake_end   = int(action.frame_range[1])
-    _log(f"  Cloth bake '{obj.name}' / '{view_layer.name}' / '{action.name}': frames {bake_start}→{bake_end}")
+    dir_info = f" / dir={direction_name}" if direction_name else ""
+    _log(f"  Cloth bake '{obj.name}' / '{view_layer.name}' / '{action.name}'{dir_info}: frames {bake_start}→{bake_end}")
 
-    slot_name = _combo_slot_name(view_layer.name, action.name)
+    slot_name = _combo_slot_name(view_layer.name, action.name, direction_name)
 
 
     for mod in obj.modifiers:
@@ -594,9 +600,9 @@ def _build_job_queue(context, export_root):
     if armature_obj is None:
         return None, "No armature selected"
 
-    camera_rig = settings.camera_rig
-    if camera_rig is None:
-        return None, "No camera rig selected"
+    rotation_rig = settings.rotation_rig
+    if rotation_rig is None:
+        return None, "No rotation rig selected"
 
     excluded_actions = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
     chr_actions = [a for a in bpy.data.actions if a.name not in excluded_actions]
@@ -661,7 +667,7 @@ def _build_job_queue(context, export_root):
                         "frame_start": frame_start,
                         "frame_end": frame_end,
                         "armature_obj": armature_obj,
-                        "camera_rig": camera_rig,
+                        "rotation_rig": rotation_rig,
                     })
         jobs.extend(action_jobs)
     return jobs, skipped
@@ -678,11 +684,19 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         type=bpy.types.Object,
         poll=lambda self, obj: obj.type == 'ARMATURE',
     )
-    camera_rig: bpy.props.PointerProperty(  # type: ignore
-        name="Camera Rig",
-        description="Empty (or object) to rotate for direction changes",
+    rotation_rig: bpy.props.PointerProperty(  # type: ignore
+        name="Rotation Rig",
+        description="Object to rotate for direction changes",
         type=bpy.types.Object,
-        poll=lambda self, obj: obj.type == 'EMPTY',
+        # No poll — any object type allowed
+    )
+    rotation_mode: bpy.props.EnumProperty(  # type: ignore
+        name="Rotation Mode",
+        items=[
+            ("CAMERA", "Camera", "Rotate rig so camera faces each direction"),
+            ("OBJECT", "Object", "Rotate rig so character faces each direction (opposite angle); cloth baked per direction"),
+        ],
+        default="CAMERA",
     )
     num_directions: bpy.props.EnumProperty(  # type: ignore
         name="Directions",
@@ -795,7 +809,7 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         min=1,
         max=8,
     )
-    camera_rig_saved_rotation: bpy.props.FloatProperty(default=float('nan'), options={'SKIP_SAVE'})  # type: ignore
+    rotation_rig_saved_rotation: bpy.props.FloatProperty(default=float('nan'), options={'SKIP_SAVE'})  # type: ignore
     show_scene_setup: bpy.props.BoolProperty(default=True)  # type: ignore
     show_output: bpy.props.BoolProperty(default=True)  # type: ignore
     show_sheet_layout: bpy.props.BoolProperty(default=True)  # type: ignore
@@ -1035,15 +1049,39 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             combos = _get_cloth_combos(context)
             orig_action = settings.armature.animation_data.action if (settings.armature and settings.armature.animation_data) else None
             orig_vl = context.window.view_layer
-            for i, (obj, vl, action) in enumerate(combos):
-                settings.progress = f"Baking cloth ({i + 1}/{len(combos)})…"
-                settings.progress_factor = (i + 1) / max(len(combos), 1)
-                for area in context.screen.areas:
-                    area.tag_redraw()
-                _bake_cloth_for_combo(context, obj, vl, action, settings.cloth_warmup_frames)
+            rotation_rig = settings.rotation_rig
+            orig_rig_z = rotation_rig.rotation_euler.z if rotation_rig else None
+
+            if settings.rotation_mode == "OBJECT":
+                # In OBJECT mode the character rotates in world space, so cloth
+                # simulation differs per direction — bake each combo per direction.
+                directions = _get_directions(settings.num_directions)
+                total_bakes = len(combos) * len(directions)
+                bake_idx = 0
+                for direction_name, angle_radians in directions:
+                    if rotation_rig:
+                        rotation_rig.rotation_euler.z = -angle_radians
+                    for obj, vl, action in combos:
+                        bake_idx += 1
+                        settings.progress = f"Baking cloth dir={direction_name} ({bake_idx}/{total_bakes})…"
+                        settings.progress_factor = bake_idx / max(total_bakes, 1)
+                        for area in context.screen.areas:
+                            area.tag_redraw()
+                        _bake_cloth_for_combo(context, obj, vl, action, settings.cloth_warmup_frames, direction_name=direction_name)
+            else:
+                # CAMERA mode: direction-agnostic, bake once per combo.
+                for i, (obj, vl, action) in enumerate(combos):
+                    settings.progress = f"Baking cloth ({i + 1}/{len(combos)})…"
+                    settings.progress_factor = (i + 1) / max(len(combos), 1)
+                    for area in context.screen.areas:
+                        area.tag_redraw()
+                    _bake_cloth_for_combo(context, obj, vl, action, settings.cloth_warmup_frames)
+
             if settings.armature and settings.armature.animation_data:
                 settings.armature.animation_data.action = orig_action
             context.window.view_layer = orig_vl
+            if rotation_rig and orig_rig_z is not None:
+                rotation_rig.rotation_euler.z = orig_rig_z
             settings.progress = ""
             settings.progress_factor = 0.0
 
@@ -1059,7 +1097,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         self._rendered = 0
         self._errors = 0
         self._orig_frame = context.scene.frame_current
-        self._orig_camera_rig_z = settings.camera_rig.rotation_euler.z if settings.camera_rig else None
+        self._orig_rotation_rig_z = settings.rotation_rig.rotation_euler.z if settings.rotation_rig else None
         self._active_cloth_paths = {}
         self._last_cloth_combo = None
 
@@ -1108,17 +1146,22 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         settings = scene.spriteloom
         action = job["action"]
         armature_obj = job["armature_obj"]
-        camera_rig = job["camera_rig"]
+        rotation_rig = job["rotation_rig"]
         frame = job["frame"]
         frame_num = frame - job["frame_start"] + 1
         frame_total = job["frame_end"] - job["frame_start"] + 1
 
-        # Activate pre-baked cloth cache paths when the (vl, action) combo changes
-        combo_key = (job["vl_name"], action.name)
+        # Activate pre-baked cloth cache paths when the combo changes.
+        # In OBJECT mode, direction is part of the combo key (per-direction bakes).
+        direction_name = job.get("direction_name")
+        if settings.rotation_mode == "OBJECT":
+            combo_key = (job["vl_name"], action.name, direction_name)
+        else:
+            combo_key = (job["vl_name"], action.name)
         if combo_key != self._last_cloth_combo:
             _restore_cloth_paths(self._active_cloth_paths)
-            _log(f"[cloth] activating cache for combo: vl={job['vl_name']}, action={action.name}")
-            self._active_cloth_paths = _activate_cloth_paths(job.get("vl_object"), action)
+            _log(f"[cloth] activating cache for combo: vl={job['vl_name']}, action={action.name}, dir={direction_name}")
+            self._active_cloth_paths = _activate_cloth_paths(job.get("vl_object"), action, direction_name=direction_name)
             self._last_cloth_combo = combo_key
 
         label = f"{action.name} / {job['vl_name']} / {job['direction_name']}"
@@ -1138,14 +1181,17 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         _log(f"  [render] assigning action '{action.name}' to '{armature_obj.name}'")
         armature_obj.animation_data.action = action
 
-        camera_rig.rotation_euler.z = job["angle_radians"]
+        if settings.rotation_mode == "OBJECT":
+            rotation_rig.rotation_euler.z = -job["angle_radians"]
+        else:
+            rotation_rig.rotation_euler.z = job["angle_radians"]
         scene.frame_set(frame)
         out_path = job["out_path"]
 
         _log(
             f"  RENDER  action={action.name}  layer={job['vl_name']}  "
             f"dir={job['direction_name']}  frame={frame}  "
-            f"cam_z={camera_rig.rotation_euler.z:.3f}"
+            f"rig_z={rotation_rig.rotation_euler.z:.3f}"
         )
 
         fmt = scene.render.image_settings
@@ -1244,8 +1290,8 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
     def _restore_scene(self, context):
         context.scene.frame_set(self._orig_frame)
         settings = context.scene.spriteloom
-        if settings.camera_rig and self._orig_camera_rig_z is not None:
-            settings.camera_rig.rotation_euler.z = self._orig_camera_rig_z
+        if settings.rotation_rig and self._orig_rotation_rig_z is not None:
+            settings.rotation_rig.rotation_euler.z = self._orig_rotation_rig_z
         _restore_cloth_paths(self._active_cloth_paths)
         self._active_cloth_paths = {}
         self._last_cloth_combo = None
@@ -1331,7 +1377,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         settings = context.scene.spriteloom
         scene = context.scene
 
-        if settings.armature is None or settings.camera_rig is None:
+        if settings.armature is None or settings.rotation_rig is None:
             if not bpy.app.timers.is_registered(_auto_detect_all):
                 bpy.app.timers.register(_auto_detect_all, first_interval=0.0)
 
@@ -1342,7 +1388,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         row.label(icon="SCENE_DATA")
         if settings.show_scene_setup:
             box.prop(settings, "armature")
-            box.prop(settings, "camera_rig")
+            box.prop(settings, "rotation_rig")
+            rot_row = box.row(align=True)
+            rot_row.label(text="Rotation:")
+            rot_row.prop(settings, "rotation_mode", expand=True)
             box.prop(settings, "num_directions")
             box.prop(settings, "frame_step")
             actions_box = box.box()
@@ -1523,9 +1572,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
 
         if settings.armature is None:
             issues.append(("ERROR", "No armature selected"))
-        if settings.camera_rig is None:
-            issues.append(("ERROR", "No camera rig selected"))
-            issues.append(("INFO", "Hint: parent your camera to an Empty"))
+        if settings.rotation_rig is None:
+            issues.append(("ERROR", "No rotation rig selected"))
 
         _excluded = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
         chr_actions = [a for a in bpy.data.actions if a.name not in _excluded]
@@ -1573,7 +1621,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
 
         if settings.show_preview:
             # Camera direction group
-            if settings.camera_rig:
+            if settings.rotation_rig:
                 import math as _math
                 dir_box = vp_box.box()
                 dir_box.label(text="Camera Direction", icon="ORIENTATION_VIEW")
@@ -1584,7 +1632,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                     op = grid.operator("spriteloom.preview_direction", text=name)
                     op.angle = angle
                     op.label = name
-                saved = settings.camera_rig_saved_rotation
+                saved = settings.rotation_rig_saved_rotation
                 reset_row = dir_box.row()
                 reset_row.enabled = not _math.isnan(saved)
                 reset_row.operator("spriteloom.reset_camera_direction", text="Reset Camera", icon="LOOP_BACK")
@@ -1605,9 +1653,10 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             else:
                 vp_col.label(text="Action: (none active on armature)", icon="ERROR")
 
-            if settings.camera_rig:
-                dir_label = _get_direction_label(settings.camera_rig.rotation_euler.z)
-                vp_col.label(text=f"Direction: {dir_label}", icon="ORIENTATION_VIEW")
+            if settings.rotation_rig:
+                dir_label = _get_direction_label(settings.rotation_rig.rotation_euler.z)
+                mode_tag = " [Object]" if settings.rotation_mode == "OBJECT" else ""
+                vp_col.label(text=f"Direction: {dir_label}{mode_tag}", icon="ORIENTATION_VIEW")
             else:
                 vp_col.label(text="Direction: (no camera rig)", icon="ERROR")
 
@@ -1772,7 +1821,7 @@ class SPRITELOOM_OT_ActivateViewLayer(bpy.types.Operator):
 
 
 class SPRITELOOM_OT_PreviewDirection(bpy.types.Operator):
-    """Set camera rig rotation to preview a render direction"""
+    """Set rotation rig to preview a render direction"""
     bl_idname = "spriteloom.preview_direction"
     bl_label = "Preview Direction"
 
@@ -1781,32 +1830,35 @@ class SPRITELOOM_OT_PreviewDirection(bpy.types.Operator):
 
     def execute(self, context):
         s = context.scene.spriteloom
-        rig = s.camera_rig
+        rig = s.rotation_rig
         if not rig:
-            self.report({'ERROR'}, "No camera rig set")
+            self.report({'ERROR'}, "No rotation rig set")
             return {'CANCELLED'}
         import math
-        if math.isnan(s.camera_rig_saved_rotation):
-            s.camera_rig_saved_rotation = rig.rotation_euler[2]
-        rig.rotation_euler[2] = self.angle
+        if math.isnan(s.rotation_rig_saved_rotation):
+            s.rotation_rig_saved_rotation = rig.rotation_euler[2]
+        if s.rotation_mode == "OBJECT":
+            rig.rotation_euler[2] = -self.angle
+        else:
+            rig.rotation_euler[2] = self.angle
         return {'FINISHED'}
 
 
 class SPRITELOOM_OT_ResetCameraDirection(bpy.types.Operator):
-    """Restore camera rig to its original rotation"""
+    """Restore rotation rig to its original rotation"""
     bl_idname = "spriteloom.reset_camera_direction"
     bl_label = "Reset"
 
     def execute(self, context):
         import math
         s = context.scene.spriteloom
-        rig = s.camera_rig
+        rig = s.rotation_rig
         if not rig:
-            self.report({'ERROR'}, "No camera rig set")
+            self.report({'ERROR'}, "No rotation rig set")
             return {'CANCELLED'}
-        if not math.isnan(s.camera_rig_saved_rotation):
-            rig.rotation_euler[2] = s.camera_rig_saved_rotation
-            s.camera_rig_saved_rotation = float('nan')
+        if not math.isnan(s.rotation_rig_saved_rotation):
+            rig.rotation_euler[2] = s.rotation_rig_saved_rotation
+            s.rotation_rig_saved_rotation = float('nan')
         return {'FINISHED'}
 
 
@@ -1871,7 +1923,7 @@ def _auto_detect_all():
 
 
 def _auto_detect(scene):
-    """Auto-fill armature and camera_rig from scene objects if not already set."""
+    """Auto-fill armature and rotation_rig from scene objects if not already set."""
     settings = scene.spriteloom
     if settings.armature is None:
         armatures = [o for o in scene.objects if o.type == 'ARMATURE']
@@ -1884,13 +1936,13 @@ def _auto_detect(scene):
                     settings.armature = by_name[name]
                     break
 
-    if settings.camera_rig is None:
+    if settings.rotation_rig is None:
         cameras = [o for o in scene.objects if o.type == 'CAMERA']
         if scene.camera:
             cameras = [scene.camera] + [c for c in cameras if c is not scene.camera]
         for cam in cameras:
             if cam.parent and cam.parent.type == 'EMPTY':
-                settings.camera_rig = cam.parent
+                settings.rotation_rig = cam.parent
                 break
 
 

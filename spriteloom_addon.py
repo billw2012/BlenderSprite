@@ -117,7 +117,7 @@ def _row_key(f, row_split_by_action, row_split_by_layer, row_split_by_direction)
 
 def _pack_sheet(np, spritesheet_root, sheet_name, frames,
                 row_split_by_action, row_split_by_layer, row_split_by_direction,
-                renumber_frames=True, frame_num_padding=2):
+                renumber_frames=True, frame_num_padding=2, frame_tag=None):
     """
     Pack a list of frame dicts into one sprite sheet, optionally split into rows.
     Each frame dict: {"filepath": str, "action": str, "layer": str, "direction": str, "frame_num": int}
@@ -183,7 +183,8 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             sheet_arr[y_px:y_px + FRAME_HEIGHT, x_px:x_px + FRAME_WIDTH, :] = arr[:FRAME_HEIGHT, :FRAME_WIDTH, :]
 
             display_num = frame_index_map[id(f)] if renumber_frames else f["frame_num"]
-            sprite_name = f"{f['action']}_{f['layer']}_{f['direction']}_{display_num:0{frame_num_padding}d}"
+            tag_part = f"_{frame_tag}" if frame_tag else ""
+            sprite_name = f"{f['action']}_{f['layer']}_{f['direction']}{tag_part}_{display_num:0{frame_num_padding}d}"
             frames_meta[sprite_name] = {
                 "frame": {"x": x_px, "y": sheet_h - y_px - FRAME_HEIGHT, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
                 "rotated": False,
@@ -307,7 +308,7 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
         ) + (f"--{frame_tag}" if frame_tag else "")
         if _pack_sheet(np, spritesheet_root, sheet_name, frames,
                        row_split_by_action, row_split_by_layer, row_split_by_direction,
-                       renumber_frames, frame_num_padding):
+                       renumber_frames, frame_num_padding, frame_tag=frame_tag):
             generated += 1
         else:
             errors += 1
@@ -541,6 +542,34 @@ def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames):
 
 
 _NORMAL_OUTPUT_NODE_NAME = "Normal Output"
+
+
+def _rotate_normal_map_inplace(path, angle_radians):
+    """
+    Rotate the XY channels of a world-space normal map PNG by -angle_radians so
+    that normals are expressed relative to the camera/screen rather than world space.
+    The Z channel (blue) is left unchanged — it encodes the toward-viewer component
+    which is constant for a camera that only orbits around the world Z axis.
+    """
+    import numpy as np
+    img = bpy.data.images.load(path, check_existing=False)
+    try:
+        w, h = img.size
+        px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+        # Remap R,G from [0,1] to [-1,1]
+        nx = px[:, :, 0] * 2.0 - 1.0
+        ny = px[:, :, 1] * 2.0 - 1.0
+        # Rotate XY by -angle (inverse of camera rotation)
+        cos_a = math.cos(angle_radians)
+        sin_a = math.sin(angle_radians)
+        px[:, :, 0] = (nx * cos_a + ny * sin_a) * 0.5 + 0.5
+        px[:, :, 1] = (-nx * sin_a + ny * cos_a) * 0.5 + 0.5
+        img.pixels = px.ravel().tolist()
+        img.filepath_raw = path
+        img.file_format = 'PNG'
+        img.save()
+    finally:
+        bpy.data.images.remove(img)
 
 
 def _find_normal_output_node(nt):
@@ -798,6 +827,11 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         name="Normal Tag",
         description="Tag used to identify normal map files (dashes are stripped; e.g. 'n' → action--layer--direction--n--0024.png)",
         default="n",
+    )
+    normal_correct_rotation: bpy.props.BoolProperty(  # type: ignore
+        name="Correct Rotation",
+        description="Rotate normal map XY channels to screen space after each render, compensating for camera orbit direction",
+        default=True,
     )
 
 
@@ -1170,6 +1204,16 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 bpy.ops.render.render("EXEC_DEFAULT", write_still=True, layer=job["vl_name"])
             _log(f"    OK  saved={out_path}")
             self._rendered += 1
+            if normal_node and settings.normal_correct_rotation:
+                normal_path = os.path.join(
+                    self._export_root,
+                    f"{job['action'].name}--{job['vl_name']}--{job['direction_name']}--{tag}--{frame:04d}.png",
+                )
+                if os.path.exists(normal_path):
+                    _rotate_normal_map_inplace(normal_path, job["angle_radians"])
+                    _log(f"    Normal rotated by {math.degrees(job['angle_radians']):.1f}°")
+                else:
+                    _log(f"    WARNING normal map not found at {normal_path}")
         except Exception as exc:
             _log(f"    ERROR {label} frame {frame}: {exc}")
             self._errors += 1
@@ -1406,6 +1450,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             row.prop(settings, "render_normals")
             if settings.render_normals:
                 row.prop(settings, "normal_tag", text="Tag")
+                row.prop(settings, "normal_correct_rotation", text="Correct Rotation", toggle=True)
 
         # --- Sheet Layout ---
         box = layout.box()

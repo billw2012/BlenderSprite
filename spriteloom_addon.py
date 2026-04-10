@@ -102,18 +102,19 @@ class RenderKey:
     action_name: str
     layer_name: str
     direction_name: str
+    scene_name: str = ""
 
     def stem(self, frame: int, tag: str = "") -> str:
-        """Filename stem (no extension): blendfile--action--layer--direction[--tag]--nnnn"""
-        parts = [self.blendfile, self.action_name, self.layer_name, self.direction_name]
+        """Filename stem (no extension): blendfile--scene--action--layer--direction[--tag]--nnnn"""
+        parts = [self.blendfile, self.scene_name, self.action_name, self.layer_name, self.direction_name]
         if tag:
             parts.append(tag)
         parts.append(f"{frame:04d}")
         return "--".join(parts)
 
     def prefix(self, tag: str = "") -> str:
-        """Prefix for exists-checks: blendfile--action--layer--direction[--tag]--"""
-        parts = [self.blendfile, self.action_name, self.layer_name, self.direction_name]
+        """Prefix for exists-checks: blendfile--scene--action--layer--direction[--tag]--"""
+        parts = [self.blendfile, self.scene_name, self.action_name, self.layer_name, self.direction_name]
         if tag:
             parts.append(tag)
         return "--".join(parts) + "--"
@@ -127,23 +128,36 @@ class RenderKey:
 
     def sheet_key(self, split_axes: set) -> tuple:
         return (
+            self.scene_name,
+            self.blendfile,
             self.action_name if 'ACTION' in split_axes else "",
             self.layer_name if 'LAYER' in split_axes else "",
             self.direction_name if 'DIRECTION' in split_axes else "",
         )
+
+    def _scene_display(self) -> str:
+        """Scene name for use in final output names: empty when it's the trivial default."""
+        try:
+            import bpy
+            trivial = len(bpy.data.scenes) == 1 and self.scene_name == "Scene"
+        except Exception:
+            trivial = False
+        return "" if trivial else self.scene_name
 
     def sheet_name(self, fmt: str, split_axes: set = frozenset({'ACTION', 'LAYER', 'DIRECTION'})) -> str:
         import re
         by_action = 'ACTION' in split_axes
         by_layer  = 'LAYER' in split_axes
         by_dir    = 'DIRECTION' in split_axes
-        name = (fmt or "").replace("{blendfile}", self.blendfile) \
+        scene_display = self._scene_display()
+        name = (fmt or "").replace("{scene}",     scene_display) \
+                          .replace("{blendfile}", self.blendfile) \
                           .replace("{action}", self.action_name if by_action else "") \
                           .replace("{layer}", self.layer_name if by_layer else "") \
                           .replace("{direction}", self.direction_name if by_dir else "")
         name = re.sub(r'[-_.]{2,}', '-', name).strip("-_. ")
         if not name:
-            parts = [self.blendfile]
+            parts = [p for p in [self.blendfile, scene_display] if p]
             if by_action: parts.append(self.action_name)
             if by_layer:  parts.append(self.layer_name)
             if by_dir:    parts.append(self.direction_name)
@@ -151,7 +165,9 @@ class RenderKey:
         return name or "spritesheet"
 
     def frame_name(self, fmt: str, frame: int, padding: int = 2) -> str:
-        name = (fmt or "").replace("{blendfile}", self.blendfile) \
+        scene_display = self._scene_display()
+        name = (fmt or "").replace("{scene}",     scene_display) \
+                          .replace("{blendfile}", self.blendfile) \
                           .replace("{action}", self.action_name) \
                           .replace("{layer}", self.layer_name) \
                           .replace("{direction}", self.direction_name) \
@@ -164,8 +180,8 @@ class RenderKey:
 
     @staticmethod
     def from_stem(parts: list) -> "RenderKey":
-        """Reconstruct from a filename stem split on '--': [blendfile, action, layer, direction, ...]"""
-        return RenderKey(blendfile=parts[0], action_name=parts[1], layer_name=parts[2], direction_name=parts[3])
+        """Reconstruct from a filename stem split on '--': [blendfile, scene, action, layer, direction, ...]"""
+        return RenderKey(blendfile=parts[0], scene_name=parts[1], action_name=parts[2], layer_name=parts[3], direction_name=parts[4])
 
 
 def _count_existing_frames(export_root, prefix):
@@ -254,10 +270,11 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             display_num = frame_index_map[id(f)] if renumber_frames else f["frame_num"]
             sprite_name = f["key"].frame_name(frame_name_format or "", display_num, padding=frame_num_padding)
             if not frame_name_format:
-                # default: blendfile_action_layer_direction[_tag]_NN
+                # default: [blendfile_][scene_]action_layer_direction[_tag]_NN
                 tag_part = f"_{frame_tag}" if frame_tag else ""
                 blend_prefix = f"{f['key'].blendfile}_" if f["key"].blendfile else ""
-                sprite_name = f"{blend_prefix}{f['key'].action_name}_{f['key'].layer_name}_{f['key'].direction_name}{tag_part}_{display_num:0{frame_num_padding}d}"
+                scene_prefix = f"{f['key']._scene_display()}_" if f["key"]._scene_display() else ""
+                sprite_name = f"{blend_prefix}{scene_prefix}{f['key'].action_name}_{f['key'].layer_name}_{f['key'].direction_name}{tag_part}_{display_num:0{frame_num_padding}d}"
             frames_meta[sprite_name] = {
                 "frame": {"x": x_px, "y": sheet_h - y_px - FRAME_HEIGHT, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
                 "rotated": False,
@@ -330,15 +347,15 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
             continue
         parts = fname[:-4].split("--")
         if frame_tag:
-            if len(parts) != 6 or parts[4] != frame_tag or not parts[5].isdigit():
+            if len(parts) != 7 or parts[5] != frame_tag or not parts[6].isdigit():
                 continue
         else:
-            if len(parts) != 5 or not parts[4].isdigit():
+            if len(parts) != 6 or not parts[5].isdigit():
                 continue
         all_frames.append({
             "filepath": os.path.join(export_root, fname),
             "key": RenderKey.from_stem(parts),
-            "frame_num": int(parts[5 if frame_tag else 4]),
+            "frame_num": int(parts[6 if frame_tag else 5]),
         })
 
     if not all_frames:
@@ -663,6 +680,7 @@ def _build_job_queue(context, export_root):
     frame_step = settings.frame_step
     overwrite = settings.overwrite_frames
     blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
+    scene_name = scene.name
 
     _log(f"Found {len(chr_actions)} action(s): {[a.name for a in chr_actions]}")
     _log(f"Mode        : {'composite' if composite_mode else 'layered'}")
@@ -684,7 +702,7 @@ def _build_job_queue(context, export_root):
         os.makedirs(export_root, exist_ok=True)
         for layer_name, vl_obj in layer_iter:
             for direction_name, angle_radians in directions:
-                rkey = RenderKey(blendfile, action.name, layer_name, direction_name)
+                rkey = RenderKey(blendfile, action.name, layer_name, direction_name, scene_name)
                 if not overwrite and _count_existing_frames(
                         export_root, rkey.prefix()) >= expected_frames:
                     _log(f"  SKIP  {rkey.label()} ({expected_frames} frames exist)")
@@ -847,14 +865,14 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
     )
     sheet_name_format: bpy.props.StringProperty(  # type: ignore
         name="Name Format",
-        description="Filename format for sprite sheets. Placeholders: {blendfile} {action} {layer} {direction}",
-        default="{blendfile}-{layer}-{action}-{direction}",
+        description="Filename format for sprite sheets. Placeholders: {scene} {blendfile} {action} {layer} {direction}",
+        default="{blendfile}-{scene}-{layer}-{action}-{direction}",
         options=set(),
     )
     frame_name_format: bpy.props.StringProperty(  # type: ignore
         name="Frame Name Format",
-        description="Frame name used inside sprite sheet JSON. Placeholders: {blendfile} {action} {layer} {direction} {frame}",
-        default="{blendfile}-{action}-{layer}-{direction}-{frame}",
+        description="Frame name used inside sprite sheet JSON. Placeholders: {scene} {blendfile} {action} {layer} {direction} {frame}",
+        default="{blendfile}-{scene}-{action}-{layer}-{direction}-{frame}",
         options=set(),
     )
     split_axes: bpy.props.EnumProperty(  # type: ignore
@@ -1623,13 +1641,13 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.prop(settings, "sheet_name_format")
             col = box.column(align=True)
             col.scale_y = 0.7
-            col.label(text="{blendfile}  {action}  {layer}  {direction}", icon='INFO')
+            col.label(text="{scene}  {blendfile}  {action}  {layer}  {direction}", icon='INFO')
 
             box.separator(factor=0.3)
             box.prop(settings, "frame_name_format")
             col = box.column(align=True)
             col.scale_y = 0.7
-            col.label(text="{blendfile}  {action}  {layer}  {direction}  {frame}", icon='INFO')
+            col.label(text="{scene}  {blendfile}  {action}  {layer}  {direction}  {frame}", icon='INFO')
 
             box.separator(factor=0.5)
             box.label(text="Example output:")
@@ -1650,6 +1668,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                             action_name=action,
                             layer_name=layer,
                             direction_name=direction,
+                            scene_name=scene.name,
                         )
                         name = key.sheet_name(settings.sheet_name_format,
                                               split_axes=set(settings.split_axes))
@@ -1670,6 +1689,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                     action_name=example_actions[0],
                     layer_name=example_layers[0],
                     direction_name=example_directions[0],
+                    scene_name=scene.name,
                 )
                 ex_frame = ex_key.frame_name(settings.frame_name_format, 1, padding=settings.frame_num_padding)
                 col = box.column(align=True)

@@ -9,6 +9,7 @@ Adds a "SpriteLoom" tab in the 3D Viewport N-panel with a
 
 import math
 import os
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION — edit these values before rendering
@@ -94,30 +95,98 @@ def _resolve_path(prop_value):
     return bpy.path.abspath(prop_value)
 
 
-def _frame_filename(action_name, layer_name, direction_name, frame):
-    """Canonical flat filename for a rendered frame. Uses -- to separate semantic parts."""
-    return f"{action_name}--{layer_name}--{direction_name}--{frame:04d}.png"
+@dataclass(frozen=True)
+class RenderKey:
+    """Bundles all naming identity fields for a rendered frame or sprite sheet."""
+    blendfile: str
+    action_name: str
+    layer_name: str
+    direction_name: str
+
+    def stem(self, frame: int, tag: str = "") -> str:
+        """Filename stem (no extension): blendfile--action--layer--direction[--tag]--nnnn"""
+        parts = [self.blendfile, self.action_name, self.layer_name, self.direction_name]
+        if tag:
+            parts.append(tag)
+        parts.append(f"{frame:04d}")
+        return "--".join(parts)
+
+    def prefix(self, tag: str = "") -> str:
+        """Prefix for exists-checks: blendfile--action--layer--direction[--tag]--"""
+        parts = [self.blendfile, self.action_name, self.layer_name, self.direction_name]
+        if tag:
+            parts.append(tag)
+        return "--".join(parts) + "--"
+
+    def slot_name(self) -> str:
+        """PointCache slot name for cloth bakes. Direction omitted when empty."""
+        def _s(v):
+            return v.replace("/", "_").replace("\\", "_").replace(" ", "_")
+        base = f"{_s(self.layer_name)}__{_s(self.action_name)}"
+        return f"{base}__{_s(self.direction_name)}" if self.direction_name else base
+
+    def sheet_key(self, split_axes: set) -> tuple:
+        return (
+            self.action_name if 'ACTION' in split_axes else "",
+            self.layer_name if 'LAYER' in split_axes else "",
+            self.direction_name if 'DIRECTION' in split_axes else "",
+        )
+
+    def sheet_name(self, fmt: str, split_axes: set = frozenset({'ACTION', 'LAYER', 'DIRECTION'})) -> str:
+        import re
+        by_action = 'ACTION' in split_axes
+        by_layer  = 'LAYER' in split_axes
+        by_dir    = 'DIRECTION' in split_axes
+        name = (fmt or "").replace("{blendfile}", self.blendfile) \
+                          .replace("{action}", self.action_name if by_action else "") \
+                          .replace("{layer}", self.layer_name if by_layer else "") \
+                          .replace("{direction}", self.direction_name if by_dir else "")
+        name = re.sub(r'[-_.]{2,}', '-', name).strip("-_. ")
+        if not name:
+            parts = [self.blendfile]
+            if by_action: parts.append(self.action_name)
+            if by_layer:  parts.append(self.layer_name)
+            if by_dir:    parts.append(self.direction_name)
+            name = "-".join(p for p in parts if p)
+        return name or "spritesheet"
+
+    def frame_name(self, fmt: str, frame: int, padding: int = 2) -> str:
+        name = (fmt or "").replace("{blendfile}", self.blendfile) \
+                          .replace("{action}", self.action_name) \
+                          .replace("{layer}", self.layer_name) \
+                          .replace("{direction}", self.direction_name) \
+                          .replace("{frame}", str(frame).zfill(padding))
+        name = name.strip("-_ ")
+        return name or f"{self.action_name}--{self.layer_name}--{self.direction_name}--{str(frame).zfill(padding)}"
+
+    def label(self) -> str:
+        return f"{self.action_name} / {self.layer_name} / {self.direction_name}"
+
+    @staticmethod
+    def from_stem(parts: list) -> "RenderKey":
+        """Reconstruct from a filename stem split on '--': [blendfile, action, layer, direction, ...]"""
+        return RenderKey(blendfile=parts[0], action_name=parts[1], layer_name=parts[2], direction_name=parts[3])
 
 
-def _count_existing_frames(export_root, action_name, layer_name, direction_name):
+def _count_existing_frames(export_root, prefix):
     if not os.path.isdir(export_root):
         return 0
-    prefix = f"{action_name}--{layer_name}--{direction_name}--"
     return len([f for f in os.listdir(export_root) if f.startswith(prefix) and f.lower().endswith(".png")])
 
 
 
-def _row_key(f, row_split_by_action, row_split_by_layer, row_split_by_direction):
+def _row_key(f, row_split_axes: set):
     parts = []
-    if row_split_by_action:    parts.append(f["action"])
-    if row_split_by_layer:     parts.append(f["layer"])
-    if row_split_by_direction: parts.append(f["direction"])
+    if 'ACTION'    in row_split_axes: parts.append(f["key"].action_name)
+    if 'LAYER'     in row_split_axes: parts.append(f["key"].layer_name)
+    if 'DIRECTION' in row_split_axes: parts.append(f["key"].direction_name)
     return tuple(parts)
 
 
 def _pack_sheet(np, spritesheet_root, sheet_name, frames,
-                row_split_by_action, row_split_by_layer, row_split_by_direction,
-                renumber_frames=True, frame_num_padding=2, frame_tag=None):
+                row_split_axes: set,
+                renumber_frames=True, frame_num_padding=2, frame_tag=None, blendfile="",
+                frame_name_format=None):
     """
     Pack a list of frame dicts into one sprite sheet, optionally split into rows.
     Each frame dict: {"filepath": str, "action": str, "layer": str, "direction": str, "frame_num": int}
@@ -125,7 +194,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     """
     import json
 
-    frames = sorted(frames, key=lambda f: (f["action"], f["layer"], f["direction"], f["frame_num"]))
+    frames = sorted(frames, key=lambda f: (f["key"].action_name, f["key"].layer_name, f["key"].direction_name, f["frame_num"]))
     if not frames:
         _log(f"  WARNING: No frames for sheet '{sheet_name}' — skipping.")
         return False
@@ -134,7 +203,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     rows_ordered = []
     rows_map = {}
     for f in frames:
-        key = _row_key(f, row_split_by_action, row_split_by_layer, row_split_by_direction)
+        key = _row_key(f, row_split_axes)
         if key not in rows_map:
             rows_map[key] = []
             rows_ordered.append(key)
@@ -156,7 +225,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     frame_index_map = {}
     groups = {}
     for f in frames:
-        groups.setdefault((f["action"], f["layer"], f["direction"]), []).append(f)
+        groups.setdefault((f["key"].action_name, f["key"].layer_name, f["key"].direction_name), []).append(f)
     for group_frames in groups.values():
         for i, f in enumerate(sorted(group_frames, key=lambda x: x["frame_num"])):
             frame_index_map[id(f)] = i
@@ -183,15 +252,19 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             sheet_arr[y_px:y_px + FRAME_HEIGHT, x_px:x_px + FRAME_WIDTH, :] = arr[:FRAME_HEIGHT, :FRAME_WIDTH, :]
 
             display_num = frame_index_map[id(f)] if renumber_frames else f["frame_num"]
-            tag_part = f"_{frame_tag}" if frame_tag else ""
-            sprite_name = f"{f['action']}_{f['layer']}_{f['direction']}{tag_part}_{display_num:0{frame_num_padding}d}"
+            sprite_name = f["key"].frame_name(frame_name_format or "", display_num, padding=frame_num_padding)
+            if not frame_name_format:
+                # default: blendfile_action_layer_direction[_tag]_NN
+                tag_part = f"_{frame_tag}" if frame_tag else ""
+                blend_prefix = f"{f['key'].blendfile}_" if f["key"].blendfile else ""
+                sprite_name = f"{blend_prefix}{f['key'].action_name}_{f['key'].layer_name}_{f['key'].direction_name}{tag_part}_{display_num:0{frame_num_padding}d}"
             frames_meta[sprite_name] = {
                 "frame": {"x": x_px, "y": sheet_h - y_px - FRAME_HEIGHT, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
                 "rotated": False,
                 "trimmed": False,
                 "spriteSourceSize": {"x": 0, "y": 0, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
                 "sourceSize": {"w": FRAME_WIDTH, "h": FRAME_HEIGHT},
-                "duration": FRAME_DURATION_OVERRIDES.get(f["action"], FRAME_DURATION_MS),
+                "duration": FRAME_DURATION_OVERRIDES.get(f["key"].action_name, FRAME_DURATION_MS),
             }
 
     sheet_img = bpy.data.images.new(sheet_name, width=sheet_w, height=sheet_h, alpha=True)
@@ -226,24 +299,12 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     return True
 
 
-def _format_sheet_name(fmt, blendfile="", action="", layer="", direction=""):
-    """Substitute placeholders and clean up empty segments."""
-    import re
-    name = fmt
-    name = name.replace("{blendfile}", blendfile)
-    name = name.replace("{action}", action)
-    name = name.replace("{layer}", layer)
-    name = name.replace("{direction}", direction)
-    name = re.sub(r'[-_\s]{2,}', lambda m: m.group(0)[0], name)
-    name = name.strip("-_ ")
-    return name or "spritesheet"
 
 
 def _run_pack(export_root, spritesheet_root, sheet_name_format,
-              split_by_action, split_by_layer, split_by_direction,
-              row_split_by_action, row_split_by_layer, row_split_by_direction,
+              split_axes: set, row_split_axes: set,
               renumber_frames=True, frame_num_padding=2,
-              frame_tag=None):
+              frame_tag=None, frame_name_format=None):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors).
 
     frame_tag: sanitized tag string (no dashes, e.g. 'n'). When set, only 5-part stems are
@@ -261,27 +322,23 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
     generated = 0
     errors = 0
 
-    blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
-
-    # Beauty:  action--layer--direction--0024.png         (4-part stem)
-    # Normals: action--layer--direction--n--0024.png      (5-part stem)
+    # Beauty:  blendfile--action--layer--direction--0024.png       (5-part stem)
+    # Normals: blendfile--action--layer--direction--n--0024.png    (6-part stem)
     all_frames = []
     for fname in os.listdir(export_root):
         if not fname.lower().endswith(".png"):
             continue
         parts = fname[:-4].split("--")
         if frame_tag:
-            if len(parts) != 5 or parts[3] != frame_tag or not parts[4].isdigit():
+            if len(parts) != 6 or parts[4] != frame_tag or not parts[5].isdigit():
                 continue
         else:
-            if len(parts) != 4 or not parts[3].isdigit():
+            if len(parts) != 5 or not parts[4].isdigit():
                 continue
         all_frames.append({
             "filepath": os.path.join(export_root, fname),
-            "action": parts[0],
-            "layer": parts[1],
-            "direction": parts[2],
-            "frame_num": int(parts[4 if frame_tag else 3]),
+            "key": RenderKey.from_stem(parts),
+            "frame_num": int(parts[5 if frame_tag else 4]),
         })
 
     if not all_frames:
@@ -291,24 +348,15 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
     # Group frames into sheets based on split settings
     sheets = {}
     for f in all_frames:
-        key = tuple([
-            f["action"] if split_by_action else "",
-            f["layer"] if split_by_layer else "",
-            f["direction"] if split_by_direction else "",
-        ])
-        sheets.setdefault(key, []).append(f)
+        sheets.setdefault(f["key"].sheet_key(split_axes), []).append(f)
 
-    for (action_key, layer_key, direction_key), frames in sorted(sheets.items()):
-        sheet_name = _format_sheet_name(
-            sheet_name_format,
-            blendfile=blendfile,
-            action=action_key,
-            layer=layer_key,
-            direction=direction_key,
-        ) + (f"--{frame_tag}" if frame_tag else "")
+    for _, frames in sorted(sheets.items()):
+        rep_key = frames[0]["key"]
+        sheet_name = rep_key.sheet_name(sheet_name_format, split_axes=split_axes) + (f"-{frame_tag}" if frame_tag else "")
         if _pack_sheet(np, spritesheet_root, sheet_name, frames,
-                       row_split_by_action, row_split_by_layer, row_split_by_direction,
-                       renumber_frames, frame_num_padding, frame_tag=frame_tag):
+                       row_split_axes,
+                       renumber_frames, frame_num_padding, frame_tag=frame_tag,
+                       frame_name_format=frame_name_format):
             generated += 1
         else:
             errors += 1
@@ -326,14 +374,6 @@ def _get_cloth_objects_in_layer(view_layer):
     ]
 
 
-def _combo_slot_name(vl_name, action_name, direction_name=None):
-    """Stable PointCache slot name for a (view_layer, action[, direction]) combo."""
-    def _safe(s):
-        return s.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    base = f"{_safe(vl_name)}__{_safe(action_name)}"
-    if direction_name is not None:
-        base = f"{base}__{_safe(direction_name)}"
-    return base
 
 
 def _find_combo_slot(mod, slot_name):
@@ -398,7 +438,7 @@ def _is_combo_baked(vl_name, action_name, direction_name=None):
     cache_dir = _blend_cache_dir()
     if not cache_dir or not os.path.isdir(cache_dir):
         return False
-    prefix = _combo_slot_name(vl_name, action_name, direction_name) + "_"
+    prefix = RenderKey("", action_name, vl_name, direction_name or "").slot_name() + "_"
     return any(f.startswith(prefix) and f.endswith('.bphys') for f in os.listdir(cache_dir))
 
 
@@ -456,7 +496,7 @@ def _activate_cloth_paths(view_layer, action, context=None, direction_name=None)
                     if _is_combo_baked(vl.name, action.name, direction_name):
                         claimed.add(key)
                         saved[key] = mod.point_cache.name
-                        slot_name = _combo_slot_name(vl.name, action.name, direction_name)
+                        slot_name = RenderKey("", action.name, vl.name, direction_name or "").slot_name()
                         if _activate_combo_slot(mod, slot_name):
                             _log(f"  [cloth] slot activated: {obj.name}/{mod.name} -> '{slot_name}' (composite vl={vl.name})")
                         else:
@@ -472,7 +512,7 @@ def _activate_cloth_paths(view_layer, action, context=None, direction_name=None)
             if not _is_combo_baked(view_layer.name, action.name, direction_name):
                 _log(f"  [cloth] ERROR: no baked cache found for {obj.name}/{mod.name} vl={view_layer.name} action={action.name} dir={direction_name} — cloth will not simulate correctly")
             saved[key] = mod.point_cache.name
-            slot_name = _combo_slot_name(view_layer.name, action.name, direction_name)
+            slot_name = RenderKey("", action.name, view_layer.name, direction_name or "").slot_name()
             if _activate_combo_slot(mod, slot_name):
                 _log(f"  [cloth] slot activated: {obj.name}/{mod.name} -> '{slot_name}'")
             else:
@@ -517,7 +557,7 @@ def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames, direc
     dir_info = f" / dir={direction_name}" if direction_name else ""
     _log(f"  Cloth bake '{obj.name}' / '{view_layer.name}' / '{action.name}'{dir_info}: frames {bake_start}→{bake_end}")
 
-    slot_name = _combo_slot_name(view_layer.name, action.name, direction_name)
+    slot_name = RenderKey("", action.name, view_layer.name, direction_name or "").slot_name()
 
 
     for mod in obj.modifiers:
@@ -622,6 +662,7 @@ def _build_job_queue(context, export_root):
     directions = _get_directions(settings.num_directions)
     frame_step = settings.frame_step
     overwrite = settings.overwrite_frames
+    blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
 
     _log(f"Found {len(chr_actions)} action(s): {[a.name for a in chr_actions]}")
     _log(f"Mode        : {'composite' if composite_mode else 'layered'}")
@@ -643,26 +684,28 @@ def _build_job_queue(context, export_root):
         os.makedirs(export_root, exist_ok=True)
         for layer_name, vl_obj in layer_iter:
             for direction_name, angle_radians in directions:
-                prefix = f"{action.name}--{layer_name}--{direction_name}--"
-                if not overwrite and _count_existing_frames(export_root, action.name, layer_name, direction_name) >= expected_frames:
-                    _log(f"  SKIP  {action.name}/{layer_name}/{direction_name} ({expected_frames} frames exist)")
+                rkey = RenderKey(blendfile, action.name, layer_name, direction_name)
+                if not overwrite and _count_existing_frames(
+                        export_root, rkey.prefix()) >= expected_frames:
+                    _log(f"  SKIP  {rkey.label()} ({expected_frames} frames exist)")
                     skipped += 1
                     continue
                 if overwrite:
                     for f in os.listdir(export_root):
-                        if f.startswith(prefix) and f.lower().endswith(".png"):
+                        if f.startswith(rkey.prefix()) and f.lower().endswith(".png"):
                             os.remove(os.path.join(export_root, f))
-                    _log(f"  CLEAR {action.name}/{layer_name}/{direction_name}")
+                    _log(f"  CLEAR {rkey.label()}")
                 for frame in frames:
                     action_jobs.append({
                         "type": "render",
+                        "key": rkey,
                         "action": action,
                         "vl_name": layer_name,
                         "vl_object": vl_obj,
                         "composite_mode": composite_mode,
                         "direction_name": direction_name,
                         "angle_radians": angle_radians,
-                        "out_path": os.path.join(export_root, _frame_filename(action.name, layer_name, direction_name, frame)),
+                        "out_path": os.path.join(export_root, rkey.stem(frame) + ".png"),
                         "frame": frame,
                         "frame_start": frame_start,
                         "frame_end": frame_end,
@@ -677,18 +720,47 @@ def _build_job_queue(context, export_root):
 # Properties
 # ---------------------------------------------------------------------------
 
+_split_axes_updating = False
+
+def _on_split_axes_update(self, context):
+    global _split_axes_updating
+    if _split_axes_updating:
+        return
+    _split_axes_updating = True
+    try:
+        overlap = set(self.split_axes) & set(self.row_split_axes)
+        if overlap:
+            self.row_split_axes = set(self.row_split_axes) - overlap
+    finally:
+        _split_axes_updating = False
+
+def _on_row_split_axes_update(self, context):
+    global _split_axes_updating
+    if _split_axes_updating:
+        return
+    _split_axes_updating = True
+    try:
+        overlap = set(self.row_split_axes) & set(self.split_axes)
+        if overlap:
+            self.split_axes = set(self.split_axes) - overlap
+    finally:
+        _split_axes_updating = False
+
+
 class SpriteLoomSettings(bpy.types.PropertyGroup):
     armature: bpy.props.PointerProperty(  # type: ignore
         name="Armature",
         description="Armature to render actions from",
         type=bpy.types.Object,
         poll=lambda self, obj: obj.type == 'ARMATURE',
+        options=set(),
     )
     rotation_rig: bpy.props.PointerProperty(  # type: ignore
         name="Rotation Rig",
         description="Object to rotate for direction changes",
         type=bpy.types.Object,
         # No poll — any object type allowed
+        options=set(),
     )
     rotation_mode: bpy.props.EnumProperty(  # type: ignore
         name="Rotation Mode",
@@ -697,6 +769,7 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
             ("OBJECT", "Object", "Rotate rig so character faces each direction (opposite angle); cloth baked per direction"),
         ],
         default="CAMERA",
+        options=set(),
     )
     num_directions: bpy.props.EnumProperty(  # type: ignore
         name="Directions",
@@ -708,11 +781,13 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
             ("16", "16 — Full",       ""),
         ],
         default="8",
+        options=set(),
     )
     actions_filter: bpy.props.StringProperty(  # type: ignore
         name="Actions",
         description="Comma-separated action names to EXCLUDE from rendering. Leave blank to render all",
         default="",
+        options=set(),
     )
     frame_step: bpy.props.IntProperty(  # type: ignore
         name="Frame Step",
@@ -720,6 +795,7 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         default=1,
         min=1,
         max=64,
+        options=set(),
     )
     output_mode: bpy.props.EnumProperty(  # type: ignore
         name="Output Mode",
@@ -729,21 +805,25 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
             ("COMPOSITE", "Composite", "Render the full compositor output as-is — no layer separation"),
         ],
         default="LAYERED",
+        options=set(),
     )
     view_layers_filter: bpy.props.StringProperty(  # type: ignore
         name="View Layers",
         description="Comma-separated view layers to render. Leave blank to render all",
         default="",
+        options=set(),
     )
     rebake_on_render: bpy.props.BoolProperty(  # type: ignore
         name="Rebake on Render",
         description="Automatically rebake all cloth combos before each render run",
         default=False,
+        options=set(),
     )
     show_cloth: bpy.props.BoolProperty(  # type: ignore
         name="Cloth Simulation",
         description="Show/hide the Cloth Simulation section",
         default=True,
+        options=set(),
     )
     cloth_warmup_frames: bpy.props.IntProperty(  # type: ignore
         name="Warmup Frames",
@@ -751,56 +831,61 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         default=20,
         min=0,
         max=500,
+        options=set(),
     )
     clean_output: bpy.props.BoolProperty(  # type: ignore
         name="Clean Before Render",
         description="Delete all files in the export directory before starting a new render",
         default=False,
+        options=set(),
     )
     overwrite_frames: bpy.props.BoolProperty(  # type: ignore
         name="Overwrite Existing Frames",
         description="Re-render and overwrite frames that already exist on disk (instead of skipping them)",
         default=False,
+        options=set(),
     )
     sheet_name_format: bpy.props.StringProperty(  # type: ignore
         name="Name Format",
         description="Filename format for sprite sheets. Placeholders: {blendfile} {action} {layer} {direction}",
         default="{blendfile}-{layer}-{action}-{direction}",
+        options=set(),
     )
-    split_by_action: bpy.props.BoolProperty(  # type: ignore
-        name="Action",
-        description="Generate a separate sprite sheet per action",
-        default=True,
+    frame_name_format: bpy.props.StringProperty(  # type: ignore
+        name="Frame Name Format",
+        description="Frame name used inside sprite sheet JSON. Placeholders: {blendfile} {action} {layer} {direction} {frame}",
+        default="{blendfile}-{action}-{layer}-{direction}-{frame}",
+        options=set(),
     )
-    split_by_layer: bpy.props.BoolProperty(  # type: ignore
-        name="Layer",
-        description="Generate a separate sprite sheet per view layer",
-        default=True,
+    split_axes: bpy.props.EnumProperty(  # type: ignore
+        name="File Splits",
+        description="Generate a separate sprite sheet per selected axis",
+        items=[
+            ('ACTION',    "Action",    "Separate sheet per action"),
+            ('LAYER',     "Layer",     "Separate sheet per view layer"),
+            ('DIRECTION', "Direction", "Separate sheet per direction"),
+        ],
+        default={'ACTION', 'LAYER'},
+        options={'ENUM_FLAG'},
+        update=_on_split_axes_update,
     )
-    split_by_direction: bpy.props.BoolProperty(  # type: ignore
-        name="Direction",
-        description="Generate a separate sprite sheet per direction",
-        default=False,
-    )
-    row_split_by_action: bpy.props.BoolProperty(  # type: ignore
-        name="Action",
-        description="Each action gets its own row",
-        default=False,
-    )
-    row_split_by_layer: bpy.props.BoolProperty(  # type: ignore
-        name="Layer",
-        description="Each view layer gets its own row",
-        default=False,
-    )
-    row_split_by_direction: bpy.props.BoolProperty(  # type: ignore
-        name="Direction",
-        description="Each direction gets its own row",
-        default=True,
+    row_split_axes: bpy.props.EnumProperty(  # type: ignore
+        name="Row Splits",
+        description="Put each selected axis on its own row within a sheet",
+        items=[
+            ('ACTION',    "Action",    "One row per action"),
+            ('LAYER',     "Layer",     "One row per view layer"),
+            ('DIRECTION', "Direction", "One row per direction"),
+        ],
+        default={'DIRECTION'},
+        options={'ENUM_FLAG'},
+        update=_on_row_split_axes_update,
     )
     renumber_frames: bpy.props.BoolProperty(  # type: ignore
         name="Renumber Frames",
         description="Frame keys in the JSON start at 0 and are consecutive, instead of using original Blender frame numbers",
         default=True,
+        options=set(),
     )
     frame_num_padding: bpy.props.IntProperty(  # type: ignore
         name="Frame Number Padding",
@@ -808,16 +893,17 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         default=2,
         min=1,
         max=8,
+        options=set(),
     )
     rotation_rig_saved_rotation: bpy.props.FloatProperty(default=float('nan'), options={'SKIP_SAVE'})  # type: ignore
-    show_scene_setup: bpy.props.BoolProperty(default=True)  # type: ignore
-    show_output: bpy.props.BoolProperty(default=True)  # type: ignore
-    show_sheet_layout: bpy.props.BoolProperty(default=True)  # type: ignore
-    show_preview: bpy.props.BoolProperty(default=True)  # type: ignore
-    show_render: bpy.props.BoolProperty(default=True)  # type: ignore
+    show_scene_setup: bpy.props.BoolProperty(default=True, options=set())  # type: ignore
+    show_output: bpy.props.BoolProperty(default=True, options=set())  # type: ignore
+    show_sheet_layout: bpy.props.BoolProperty(default=True, options=set())  # type: ignore
+    show_preview: bpy.props.BoolProperty(default=True, options=set())  # type: ignore
+    show_render: bpy.props.BoolProperty(default=True, options=set())  # type: ignore
     progress: bpy.props.StringProperty(default="", options={'SKIP_SAVE'})  # type: ignore
     progress_factor: bpy.props.FloatProperty(default=0.0, options={'SKIP_SAVE'})  # type: ignore
-    last_result: bpy.props.StringProperty(default="")  # type: ignore
+    last_result: bpy.props.StringProperty(default="", options=set())  # type: ignore
     export_root: bpy.props.StringProperty(  # type: ignore
         name="Export Root",
         description="Folder for rendered frames. // paths are relative to the .blend file",
@@ -836,16 +922,19 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         name="Render Normal Maps",
         description="Capture Normal render pass alongside beauty, saved with a tag suffix",
         default=False,
+        options=set(),
     )
     normal_tag: bpy.props.StringProperty(  # type: ignore
         name="Normal Tag",
         description="Tag used to identify normal map files (dashes are stripped; e.g. 'n' → action--layer--direction--n--0024.png)",
         default="n",
+        options=set(),
     )
     normal_correct_rotation: bpy.props.BoolProperty(  # type: ignore
         name="Correct Rotation",
         description="Rotate normal map XY channels to screen space after each render, compensating for camera orbit direction",
         default=True,
+        options=set(),
     )
 
 
@@ -987,7 +1076,7 @@ class SPRITELOOM_OT_DeleteBakes(bpy.types.Operator):
         combos = _get_cloth_combos(context)
         deleted_files = 0
         for _, vl, action in combos:
-            slot_name = _combo_slot_name(vl.name, action.name)
+            slot_name = RenderKey("", action.name, vl.name, "").slot_name()
             prefix = slot_name + "_"
             for f in os.listdir(cache_dir):
                 if f.startswith(prefix) and (f.endswith('.bphys') or f.endswith('.bobj.gz')):
@@ -1031,6 +1120,13 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         if not self._export_root:
             self.report({"ERROR"}, "Save the .blend file first, or set an explicit Export Root path.")
             return {"CANCELLED"}
+
+        # Force Object Mode so frame_set() properly updates the depsgraph for
+        # armature-deformed meshes. In Edit/Sculpt/etc. mode the evaluated mesh
+        # is frozen at its rest state and renders come out static.
+        if context.mode != 'OBJECT':
+            _log(f"Switching from '{context.mode}' to OBJECT mode before render")
+            bpy.ops.object.mode_set(mode='OBJECT')
 
         _log("=== SpriteLoom: Render All started ===")
         _log(f"Export root     : {self._export_root}")
@@ -1164,7 +1260,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             self._active_cloth_paths = _activate_cloth_paths(job.get("vl_object"), action, direction_name=direction_name)
             self._last_cloth_combo = combo_key
 
-        label = f"{action.name} / {job['vl_name']} / {job['direction_name']}"
+        label = job["key"].label()
         scene.spriteloom.progress = (
             f"{label}  frame {frame_num}/{frame_total}  "
             f"({self._rendered + 1}/{self._render_total})"
@@ -1189,8 +1285,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         out_path = job["out_path"]
 
         _log(
-            f"  RENDER  action={action.name}  layer={job['vl_name']}  "
-            f"dir={job['direction_name']}  frame={frame}  "
+            f"  RENDER  {job['key'].label()}  frame={frame}  "
             f"rig_z={rotation_rig.rotation_euler.z:.3f}"
         )
 
@@ -1234,8 +1329,8 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 orig_normal_fmt = normal_node.format.file_format
                 tag = settings.normal_tag.replace("-", "").strip()
                 normal_node.directory = self._export_root
-                normal_node.file_name = (f"{job['action'].name}--{job['vl_name']}--"
-                                         f"{job['direction_name']}--{tag}--{frame:04d}")
+                # file_name has no extension — Blender appends .png automatically
+                normal_node.file_name = job["key"].stem(frame, tag=tag)
                 normal_node.file_output_items[0].name = ""
                 normal_node.format.file_format = "PNG"
 
@@ -1253,7 +1348,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             if normal_node and settings.normal_correct_rotation:
                 normal_path = os.path.join(
                     self._export_root,
-                    f"{job['action'].name}--{job['vl_name']}--{job['direction_name']}--{tag}--{frame:04d}.png",
+                    job["key"].stem(frame, tag=tag) + ".png",
                 )
                 if os.path.exists(normal_path):
                     _rotate_normal_map_inplace(normal_path, job["angle_radians"])
@@ -1289,6 +1384,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
 
     def _restore_scene(self, context):
         context.scene.frame_set(self._orig_frame)
+
         settings = context.scene.spriteloom
         if settings.rotation_rig and self._orig_rotation_rig_z is not None:
             settings.rotation_rig.rotation_euler.z = self._orig_rotation_rig_z
@@ -1326,9 +1422,9 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         packed, pack_skipped, pack_errors = _run_pack(
             self._export_root, self._spritesheet_root,
             settings.sheet_name_format,
-            settings.split_by_action, settings.split_by_layer, settings.split_by_direction,
-            settings.row_split_by_action, settings.row_split_by_layer, settings.row_split_by_direction,
+            set(settings.split_axes), set(settings.row_split_axes),
             settings.renumber_frames, settings.frame_num_padding,
+            frame_name_format=settings.frame_name_format,
         )
 
         _log(f"=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
@@ -1345,10 +1441,9 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             n_packed, n_skipped, n_errors = _run_pack(
                 self._export_root, self._spritesheet_root,
                 settings.sheet_name_format,
-                settings.split_by_action, settings.split_by_layer, settings.split_by_direction,
-                settings.row_split_by_action, settings.row_split_by_layer, settings.row_split_by_direction,
+                set(settings.split_axes), set(settings.row_split_axes),
                 settings.renumber_frames, settings.frame_num_padding,
-                frame_tag=normal_tag,
+                frame_tag=normal_tag, frame_name_format=settings.frame_name_format,
             )
             _log(f"=== Normal pack complete — {n_packed} generated, {n_skipped} skipped, {n_errors} errors ===")
             total_errors += n_errors
@@ -1507,23 +1602,16 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         row.prop(settings, "show_sheet_layout", icon="TRIA_DOWN" if settings.show_sheet_layout else "TRIA_RIGHT", emboss=False, text="Sheet Layout", icon_only=False)
         row.label(icon="IMAGE_DATA")
         if settings.show_sheet_layout:
-            box.label(text="File splits:")
             row = box.row(align=True)
-            row.prop(settings, "split_by_layer")
-            row.prop(settings, "split_by_action")
-            row.prop(settings, "split_by_direction")
-
-            box.label(text="Row splits:")
+            row.label(text="File splits:")
+            row.prop_enum(settings, "split_axes", 'ACTION')
+            row.prop_enum(settings, "split_axes", 'LAYER')
+            row.prop_enum(settings, "split_axes", 'DIRECTION')
             row = box.row(align=True)
-            sub = row.row()
-            sub.enabled = not settings.split_by_layer
-            sub.prop(settings, "row_split_by_layer")
-            sub = row.row()
-            sub.enabled = not settings.split_by_action
-            sub.prop(settings, "row_split_by_action")
-            sub = row.row()
-            sub.enabled = not settings.split_by_direction
-            sub.prop(settings, "row_split_by_direction")
+            row.label(text="Row splits:")
+            row.prop_enum(settings, "row_split_axes", 'ACTION')
+            row.prop_enum(settings, "row_split_axes", 'LAYER')
+            row.prop_enum(settings, "row_split_axes", 'DIRECTION')
 
             box.separator(factor=0.5)
             row = box.row(align=True)
@@ -1536,6 +1624,12 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             col = box.column(align=True)
             col.scale_y = 0.7
             col.label(text="{blendfile}  {action}  {layer}  {direction}", icon='INFO')
+
+            box.separator(factor=0.3)
+            box.prop(settings, "frame_name_format")
+            col = box.column(align=True)
+            col.scale_y = 0.7
+            col.label(text="{blendfile}  {action}  {layer}  {direction}  {frame}", icon='INFO')
 
             box.separator(factor=0.5)
             box.label(text="Example output:")
@@ -1550,14 +1644,15 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             seen = []
             for action in example_actions:
                 for layer in example_layers:
-                    for direction in (example_directions if settings.split_by_direction else [""]):
-                        name = _format_sheet_name(
-                            settings.sheet_name_format,
+                    for direction in (example_directions if 'DIRECTION' in settings.split_axes else [""]):
+                        key = RenderKey(
                             blendfile=blendfile,
-                            action=action if settings.split_by_action else "",
-                            layer=layer if settings.split_by_layer else "",
-                            direction=direction if settings.split_by_direction else "",
+                            action_name=action,
+                            layer_name=layer,
+                            direction_name=direction,
                         )
+                        name = key.sheet_name(settings.sheet_name_format,
+                                              split_axes=set(settings.split_axes))
                         if name not in seen:
                             seen.append(name)
             col = box.column(align=True)
@@ -1566,6 +1661,20 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 col.label(text=f"{name}.png", icon='FILE_IMAGE')
             if len(seen) > 5:
                 col.label(text=f"+{len(seen) - 5} more…", icon='BLANK1')
+
+            box.separator(factor=0.3)
+            box.label(text="Example frame:")
+            if example_actions and example_layers and example_directions:
+                ex_key = RenderKey(
+                    blendfile=blendfile,
+                    action_name=example_actions[0],
+                    layer_name=example_layers[0],
+                    direction_name=example_directions[0],
+                )
+                ex_frame = ex_key.frame_name(settings.frame_name_format, 1, padding=settings.frame_num_padding)
+                col = box.column(align=True)
+                col.scale_y = 0.75
+                col.label(text=ex_frame, icon='FILE_IMAGE')
 
         # --- Validation warnings ---
         issues = []
@@ -1736,14 +1845,21 @@ class SPRITELOOM_OT_RenderVideoPreview(bpy.types.Operator):
 
         # Save render state
         orig_filepath = scene.render.filepath
+        orig_media_type = scene.render.image_settings.media_type
         orig_format = scene.render.image_settings.file_format
         orig_frame_start = scene.frame_start
         orig_frame_end = scene.frame_end
+        orig_mode = context.mode
+
+        if orig_mode != 'OBJECT':
+            _log(f"Switching from '{orig_mode}' to OBJECT mode before preview render")
+            bpy.ops.object.mode_set(mode='OBJECT')
 
         try:
             scene.frame_start = int(action.frame_range[0])
             scene.frame_end = int(action.frame_range[1])
             scene.render.filepath = video_path
+            scene.render.image_settings.media_type = "VIDEO"
             scene.render.image_settings.file_format = "FFMPEG"
             scene.render.ffmpeg.format = "MPEG4"
             scene.render.ffmpeg.codec = "H264"
@@ -1752,6 +1868,7 @@ class SPRITELOOM_OT_RenderVideoPreview(bpy.types.Operator):
             bpy.ops.render.render("EXEC_DEFAULT", animation=True)
         finally:
             scene.render.filepath = orig_filepath
+            scene.render.image_settings.media_type = orig_media_type
             scene.render.image_settings.file_format = orig_format
             scene.frame_start = orig_frame_start
             scene.frame_end = orig_frame_end

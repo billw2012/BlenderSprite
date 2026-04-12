@@ -78,12 +78,31 @@ def _log(msg):
     print(f"[SpriteLoom] {msg}", flush=True)
 
 
+# Sentinel stored in actions_include / compositors_include to mean "nothing selected".
+# Empty string means "all selected" (default). This sentinel disambiguates the two.
+_FILTER_NONE = "__none__"
+
+
+def _parse_include(filter_str):
+    """Parse an opt-in filter string.
+    Returns None  → all items included (empty string default).
+    Returns set() → nothing included (sentinel).
+    Returns set   → only the named items are included.
+    """
+    s = filter_str.strip()
+    if s == _FILTER_NONE:
+        return set()
+    if not s:
+        return None
+    return {n.strip() for n in s.split(",") if n.strip()}
+
+
 def _resolve_compositors(filter_str):
-    """Return COMPOSITING node groups not in the exclusion CSV."""
+    """Return COMPOSITING node groups matching the inclusion filter (empty = all)."""
     groups = [ng for ng in bpy.data.node_groups if ng.type == 'COMPOSITING']
-    if filter_str.strip():
-        excluded = {s.strip() for s in filter_str.split(",") if s.strip()}
-        groups = [ng for ng in groups if ng.name not in excluded]
+    included = _parse_include(filter_str)
+    if included is not None:
+        groups = [ng for ng in groups if ng.name in included]
     return groups
 
 
@@ -468,8 +487,8 @@ def _get_cloth_combos(context):
     """
     scene = context.scene
     settings = scene.spriteloom
-    excluded_actions = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
-    actions = [a for a in bpy.data.actions if a.name not in excluded_actions]
+    included_actions = _parse_include(settings.actions_include)
+    actions = [a for a in bpy.data.actions if included_actions is None or a.name in included_actions]
 
     view_layers = list(scene.view_layers)
 
@@ -639,12 +658,12 @@ def _build_job_queue(context, export_root):
     if rotation_rig is None:
         return None, "No rotation rig selected"
 
-    excluded_actions = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
-    chr_actions = [a for a in bpy.data.actions if a.name not in excluded_actions]
+    included_actions = _parse_include(settings.actions_include)
+    chr_actions = [a for a in bpy.data.actions if included_actions is None or a.name in included_actions]
     if not chr_actions:
         return None, "No actions to render (none in file or all excluded)"
 
-    compositors = _resolve_compositors(settings.compositors_filter)
+    compositors = _resolve_compositors(settings.compositors_include)
     if not compositors:
         return None, "No compositor node groups to render"
     compositor_iter = [(ng.name, ng) for ng in compositors]
@@ -771,9 +790,9 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         default="8",
         options=set(),
     )
-    actions_filter: bpy.props.StringProperty(  # type: ignore
+    actions_include: bpy.props.StringProperty(  # type: ignore
         name="Actions",
-        description="Comma-separated action names to EXCLUDE from rendering. Leave blank to render all",
+        description="Comma-separated action names to include in rendering. Leave blank to render all",
         default="",
         options=set(),
     )
@@ -785,9 +804,9 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         max=64,
         options=set(),
     )
-    compositors_filter: bpy.props.StringProperty(  # type: ignore
+    compositors_include: bpy.props.StringProperty(  # type: ignore
         name="Compositors",
-        description="Comma-separated compositor node group names to exclude. Leave blank to render all",
+        description="Comma-separated compositor node group names to include in rendering. Leave blank to render all",
         default="",
         options=set(),
     )
@@ -1449,7 +1468,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             actions_box.label(text="Actions", icon="ACTION")
             all_actions = list(bpy.data.actions)
             if all_actions:
-                excluded_actions = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
+                _inc_actions = _parse_include(settings.actions_include)
                 col = actions_box.column(align=True)
                 col.scale_y = 0.75
                 for a in all_actions:
@@ -1457,7 +1476,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                     frame_end = int(a.frame_range[1])
                     loop_end = frame_end if a.use_cyclic else frame_end + 1
                     frame_count = len(range(frame_start, loop_end, settings.frame_step))
-                    is_on = a.name not in excluded_actions
+                    is_on = _inc_actions is None or a.name in _inc_actions
                     loop_suffix = "  \u21ba" if a.use_cyclic else ""
                     row = col.row(align=True)
                     op = row.operator("spriteloom.toggle_action",
@@ -1523,11 +1542,11 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             comp_box = box.box()
             comp_box.label(text="Compositors", icon="NODE_COMPOSITING")
             if comp_groups:
-                excluded = {s.strip() for s in settings.compositors_filter.split(",") if s.strip()}
+                _inc_comps = _parse_include(settings.compositors_include)
                 col = comp_box.column(align=True)
                 col.scale_y = 0.75
                 for ng in comp_groups:
-                    is_on = ng.name not in excluded
+                    is_on = _inc_comps is None or ng.name in _inc_comps
                     row = col.row(align=True)
                     op = row.operator("spriteloom.toggle_compositor",
                                       text=ng.name,
@@ -1591,9 +1610,9 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.separator(factor=0.5)
             box.label(text="Example output:")
             blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
-            _ex_excluded = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
-            example_actions = [a.name for a in bpy.data.actions if a.name not in _ex_excluded] or ["chr_walk", "chr_idle"]
-            example_compositors = [ng.name for ng in _resolve_compositors(settings.compositors_filter)] or ["compositor"]
+            _ex_inc = _parse_include(settings.actions_include)
+            example_actions = [a.name for a in bpy.data.actions if _ex_inc is None or a.name in _ex_inc] or ["chr_walk", "chr_idle"]
+            example_compositors = [ng.name for ng in _resolve_compositors(settings.compositors_include)] or ["compositor"]
             example_directions = [d[0] for d in _get_directions(settings.num_directions)]
             seen = []
             for action in example_actions:
@@ -1640,14 +1659,14 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         if settings.rotation_rig is None:
             issues.append(("ERROR", "No rotation rig selected"))
 
-        _excluded = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
-        chr_actions = [a for a in bpy.data.actions if a.name not in _excluded]
+        _included = _parse_include(settings.actions_include)
+        chr_actions = [a for a in bpy.data.actions if _included is None or a.name in _included]
         if not chr_actions:
-            issues.append(("ERROR", "No actions to render (none in file or all excluded)"))
+            issues.append(("ERROR", "No actions to render (none in file or none checked)"))
             if bpy.data.actions:
-                issues.append(("INFO", "Hint: uncheck at least one action above"))
+                issues.append(("INFO", "Hint: check at least one action above"))
 
-        if not _resolve_compositors(settings.compositors_filter):
+        if not _resolve_compositors(settings.compositors_include):
             issues.append(("ERROR", "No compositor node groups to render"))
 
         if not _resolve_path(settings.export_root):
@@ -1687,7 +1706,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             if settings.rotation_rig:
                 import math as _math
                 dir_box = vp_box.box()
-                dir_box.label(text="Camera Direction", icon="ORIENTATION_VIEW")
+                dir_title = "Camera Direction" if settings.rotation_mode == "CAMERA" else "Object Direction"
+                dir_box.label(text=dir_title, icon="ORIENTATION_VIEW")
                 directions = _get_directions(settings.num_directions)
                 cols = min(len(directions), 4)
                 grid = dir_box.grid_flow(row_major=True, columns=cols, even_columns=True, even_rows=False, align=True)
@@ -1696,9 +1716,11 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                     op.angle = angle
                     op.label = name
                 saved = settings.rotation_rig_saved_rotation
+                rig_z = settings.rotation_rig.rotation_euler[2] if settings.rotation_rig else 0.0
                 reset_row = dir_box.row()
-                reset_row.enabled = not _math.isnan(saved)
-                reset_row.operator("spriteloom.reset_camera_direction", text="Reset Camera", icon="LOOP_BACK")
+                reset_row.enabled = not _math.isnan(saved) or abs(rig_z) > 1e-6
+                reset_text = "Reset Camera" if settings.rotation_mode == "CAMERA" else "Reset Object"
+                reset_row.operator("spriteloom.reset_camera_direction", text=reset_text, icon="LOOP_BACK")
 
             vp_armature = settings.armature
             vp_action = (
@@ -1928,6 +1950,8 @@ class SPRITELOOM_OT_ResetCameraDirection(bpy.types.Operator):
         if not math.isnan(s.rotation_rig_saved_rotation):
             rig.rotation_euler[2] = s.rotation_rig_saved_rotation
             s.rotation_rig_saved_rotation = float('nan')
+        else:
+            rig.rotation_euler[2] = 0.0
         return {'FINISHED'}
 
 
@@ -1941,12 +1965,20 @@ class SPRITELOOM_OT_ToggleAction(bpy.types.Operator):
     def execute(self, context):
         settings = context.scene.spriteloom
         all_names = [a.name for a in bpy.data.actions]
-        excluded = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
-        if self.action_name in excluded:
-            excluded.discard(self.action_name)
+        current = _parse_include(settings.actions_include)
+        if current is None:
+            # Was "all" — uncheck this one, include all others
+            included = set(all_names) - {self.action_name}
+        elif self.action_name in current:
+            included = current - {self.action_name}
         else:
-            excluded.add(self.action_name)
-        settings.actions_filter = ", ".join(n for n in all_names if n in excluded)
+            included = current | {self.action_name}
+        if included == set(all_names):
+            settings.actions_include = ""          # all → clear to default
+        elif not included:
+            settings.actions_include = _FILTER_NONE  # none → sentinel
+        else:
+            settings.actions_include = ", ".join(n for n in all_names if n in included)
         return {'FINISHED'}
 
 
@@ -1960,12 +1992,20 @@ class SPRITELOOM_OT_ToggleCompositor(bpy.types.Operator):
     def execute(self, context):
         settings = context.scene.spriteloom
         all_names = [ng.name for ng in bpy.data.node_groups if ng.type == 'COMPOSITING']
-        excluded = {s.strip() for s in settings.compositors_filter.split(",") if s.strip()}
-        if self.compositor_name in excluded:
-            excluded.discard(self.compositor_name)
+        current = _parse_include(settings.compositors_include)
+        if current is None:
+            # Was "all" — uncheck this one, include all others
+            included = set(all_names) - {self.compositor_name}
+        elif self.compositor_name in current:
+            included = current - {self.compositor_name}
         else:
-            excluded.add(self.compositor_name)
-        settings.compositors_filter = ", ".join(n for n in all_names if n in excluded)
+            included = current | {self.compositor_name}
+        if included == set(all_names):
+            settings.compositors_include = ""          # all → clear to default
+        elif not included:
+            settings.compositors_include = _FILTER_NONE  # none → sentinel
+        else:
+            settings.compositors_include = ", ".join(n for n in all_names if n in included)
         return {'FINISHED'}
 
 

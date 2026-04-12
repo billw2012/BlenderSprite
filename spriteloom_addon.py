@@ -78,12 +78,13 @@ def _log(msg):
     print(f"[SpriteLoom] {msg}", flush=True)
 
 
-def _resolve_view_layers(scene, filter_str):
-    """Return view layer objects to render. filter_str is a CSV of EXCLUDED layers; empty = all included."""
+def _resolve_compositors(filter_str):
+    """Return COMPOSITING node groups not in the exclusion CSV."""
+    groups = [ng for ng in bpy.data.node_groups if ng.type == 'COMPOSITING']
     if filter_str.strip():
-        excluded = {n.strip() for n in filter_str.split(",") if n.strip()}
-        return [vl for vl in scene.view_layers if vl.name not in excluded]
-    return list(scene.view_layers)
+        excluded = {s.strip() for s in filter_str.split(",") if s.strip()}
+        groups = [ng for ng in groups if ng.name not in excluded]
+    return groups
 
 
 def _resolve_path(prop_value):
@@ -100,21 +101,21 @@ class RenderKey:
     """Bundles all naming identity fields for a rendered frame or sprite sheet."""
     blendfile: str
     action_name: str
-    layer_name: str
+    compositor_name: str
     direction_name: str
     scene_name: str = ""
 
     def stem(self, frame: int, tag: str = "") -> str:
-        """Filename stem (no extension): blendfile--scene--action--layer--direction[--tag]--nnnn"""
-        parts = [self.blendfile, self.scene_name, self.action_name, self.layer_name, self.direction_name]
+        """Filename stem (no extension): blendfile--scene--action--compositor--direction[--tag]--nnnn"""
+        parts = [self.blendfile, self.scene_name, self.action_name, self.compositor_name, self.direction_name]
         if tag:
             parts.append(tag)
         parts.append(f"{frame:04d}")
         return "--".join(parts)
 
     def prefix(self, tag: str = "") -> str:
-        """Prefix for exists-checks: blendfile--scene--action--layer--direction[--tag]--"""
-        parts = [self.blendfile, self.scene_name, self.action_name, self.layer_name, self.direction_name]
+        """Prefix for exists-checks: blendfile--scene--action--compositor--direction[--tag]--"""
+        parts = [self.blendfile, self.scene_name, self.action_name, self.compositor_name, self.direction_name]
         if tag:
             parts.append(tag)
         return "--".join(parts) + "--"
@@ -123,7 +124,7 @@ class RenderKey:
         """PointCache slot name for cloth bakes. Direction omitted when empty."""
         def _s(v):
             return v.replace("/", "_").replace("\\", "_").replace(" ", "_")
-        base = f"{_s(self.layer_name)}__{_s(self.action_name)}"
+        base = f"{_s(self.compositor_name)}__{_s(self.action_name)}"
         return f"{base}__{_s(self.direction_name)}" if self.direction_name else base
 
     def sheet_key(self, split_axes: set) -> tuple:
@@ -131,7 +132,7 @@ class RenderKey:
             self.scene_name,
             self.blendfile,
             self.action_name if 'ACTION' in split_axes else "",
-            self.layer_name if 'LAYER' in split_axes else "",
+            self.compositor_name if 'COMPOSITOR' in split_axes else "",
             self.direction_name if 'DIRECTION' in split_axes else "",
         )
 
@@ -144,44 +145,44 @@ class RenderKey:
             trivial = False
         return "" if trivial else self.scene_name
 
-    def sheet_name(self, fmt: str, split_axes: set = frozenset({'ACTION', 'LAYER', 'DIRECTION'})) -> str:
+    def sheet_name(self, fmt: str, split_axes: set = frozenset({'ACTION', 'COMPOSITOR', 'DIRECTION'})) -> str:
         import re
-        by_action = 'ACTION' in split_axes
-        by_layer  = 'LAYER' in split_axes
-        by_dir    = 'DIRECTION' in split_axes
+        by_action     = 'ACTION' in split_axes
+        by_compositor = 'COMPOSITOR' in split_axes
+        by_dir        = 'DIRECTION' in split_axes
         scene_display = self._scene_display()
-        name = (fmt or "").replace("{scene}",     scene_display) \
-                          .replace("{blendfile}", self.blendfile) \
-                          .replace("{action}", self.action_name if by_action else "") \
-                          .replace("{layer}", self.layer_name if by_layer else "") \
-                          .replace("{direction}", self.direction_name if by_dir else "")
+        name = (fmt or "").replace("{scene}",      scene_display) \
+                          .replace("{blendfile}",  self.blendfile) \
+                          .replace("{action}",     self.action_name if by_action else "") \
+                          .replace("{compositor}", self.compositor_name if by_compositor else "") \
+                          .replace("{direction}",  self.direction_name if by_dir else "")
         name = re.sub(r'[-_.]{2,}', '-', name).strip("-_. ")
         if not name:
             parts = [p for p in [self.blendfile, scene_display] if p]
-            if by_action: parts.append(self.action_name)
-            if by_layer:  parts.append(self.layer_name)
-            if by_dir:    parts.append(self.direction_name)
+            if by_action:     parts.append(self.action_name)
+            if by_compositor: parts.append(self.compositor_name)
+            if by_dir:        parts.append(self.direction_name)
             name = "-".join(p for p in parts if p)
         return name or "spritesheet"
 
     def frame_name(self, fmt: str, frame: int, padding: int = 2) -> str:
         scene_display = self._scene_display()
-        name = (fmt or "").replace("{scene}",     scene_display) \
-                          .replace("{blendfile}", self.blendfile) \
-                          .replace("{action}", self.action_name) \
-                          .replace("{layer}", self.layer_name) \
-                          .replace("{direction}", self.direction_name) \
-                          .replace("{frame}", str(frame).zfill(padding))
+        name = (fmt or "").replace("{scene}",      scene_display) \
+                          .replace("{blendfile}",  self.blendfile) \
+                          .replace("{action}",     self.action_name) \
+                          .replace("{compositor}", self.compositor_name) \
+                          .replace("{direction}",  self.direction_name) \
+                          .replace("{frame}",      str(frame).zfill(padding))
         name = name.strip("-_ ")
-        return name or f"{self.action_name}--{self.layer_name}--{self.direction_name}--{str(frame).zfill(padding)}"
+        return name or f"{self.action_name}--{self.compositor_name}--{self.direction_name}--{str(frame).zfill(padding)}"
 
     def label(self) -> str:
-        return f"{self.action_name} / {self.layer_name} / {self.direction_name}"
+        return f"{self.action_name} / {self.compositor_name} / {self.direction_name}"
 
     @staticmethod
     def from_stem(parts: list) -> "RenderKey":
-        """Reconstruct from a filename stem split on '--': [blendfile, scene, action, layer, direction, ...]"""
-        return RenderKey(blendfile=parts[0], scene_name=parts[1], action_name=parts[2], layer_name=parts[3], direction_name=parts[4])
+        """Reconstruct from a filename stem split on '--': [blendfile, scene, action, compositor, direction, ...]"""
+        return RenderKey(blendfile=parts[0], scene_name=parts[1], action_name=parts[2], compositor_name=parts[3], direction_name=parts[4])
 
 
 def _count_existing_frames(export_root, prefix):
@@ -193,9 +194,9 @@ def _count_existing_frames(export_root, prefix):
 
 def _row_key(f, row_split_axes: set):
     parts = []
-    if 'ACTION'    in row_split_axes: parts.append(f["key"].action_name)
-    if 'LAYER'     in row_split_axes: parts.append(f["key"].layer_name)
-    if 'DIRECTION' in row_split_axes: parts.append(f["key"].direction_name)
+    if 'ACTION'      in row_split_axes: parts.append(f["key"].action_name)
+    if 'COMPOSITOR'  in row_split_axes: parts.append(f["key"].compositor_name)
+    if 'DIRECTION'   in row_split_axes: parts.append(f["key"].direction_name)
     return tuple(parts)
 
 
@@ -210,7 +211,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     """
     import json
 
-    frames = sorted(frames, key=lambda f: (f["key"].action_name, f["key"].layer_name, f["key"].direction_name, f["frame_num"]))
+    frames = sorted(frames, key=lambda f: (f["key"].action_name, f["key"].compositor_name, f["key"].direction_name, f["frame_num"]))
     if not frames:
         _log(f"  WARNING: No frames for sheet '{sheet_name}' — skipping.")
         return False
@@ -237,11 +238,11 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
     sheet_arr = np.zeros((sheet_h, sheet_w, 4), dtype=np.float32)
     frames_meta = {}
 
-    # Build per-(action, layer, direction) 0-based consecutive index map for renumbering
+    # Build per-(action, compositor, direction) 0-based consecutive index map for renumbering
     frame_index_map = {}
     groups = {}
     for f in frames:
-        groups.setdefault((f["key"].action_name, f["key"].layer_name, f["key"].direction_name), []).append(f)
+        groups.setdefault((f["key"].action_name, f["key"].compositor_name, f["key"].direction_name), []).append(f)
     for group_frames in groups.values():
         for i, f in enumerate(sorted(group_frames, key=lambda x: x["frame_num"])):
             frame_index_map[id(f)] = i
@@ -270,11 +271,11 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             display_num = frame_index_map[id(f)] if renumber_frames else f["frame_num"]
             sprite_name = f["key"].frame_name(frame_name_format or "", display_num, padding=frame_num_padding)
             if not frame_name_format:
-                # default: [blendfile_][scene_]action_layer_direction[_tag]_NN
+                # default: [blendfile_][scene_]action_compositor_direction[_tag]_NN
                 tag_part = f"_{frame_tag}" if frame_tag else ""
                 blend_prefix = f"{f['key'].blendfile}_" if f["key"].blendfile else ""
                 scene_prefix = f"{f['key']._scene_display()}_" if f["key"]._scene_display() else ""
-                sprite_name = f"{blend_prefix}{scene_prefix}{f['key'].action_name}_{f['key'].layer_name}_{f['key'].direction_name}{tag_part}_{display_num:0{frame_num_padding}d}"
+                sprite_name = f"{blend_prefix}{scene_prefix}{f['key'].action_name}_{f['key'].compositor_name}_{f['key'].direction_name}{tag_part}_{display_num:0{frame_num_padding}d}"
             frames_meta[sprite_name] = {
                 "frame": {"x": x_px, "y": sheet_h - y_px - FRAME_HEIGHT, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
                 "rotated": False,
@@ -339,8 +340,8 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
     generated = 0
     errors = 0
 
-    # Beauty:  blendfile--action--layer--direction--0024.png       (5-part stem)
-    # Normals: blendfile--action--layer--direction--n--0024.png    (6-part stem)
+    # Beauty:  blendfile--action--compositor--direction--0024.png       (5-part stem)
+    # Normals: blendfile--action--compositor--direction--n--0024.png    (6-part stem)
     all_frames = []
     for fname in os.listdir(export_root):
         if not fname.lower().endswith(".png"):
@@ -463,17 +464,14 @@ def _get_cloth_combos(context):
     """
     Return list of (cloth_obj, view_layer, action) for all active combos
     given the current SpriteLoom settings.
-    For COMPOSITE mode, uses only the current window view layer.
+    Scans all scene view layers to find layers that have cloth enabled.
     """
     scene = context.scene
     settings = scene.spriteloom
     excluded_actions = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
     actions = [a for a in bpy.data.actions if a.name not in excluded_actions]
 
-    if settings.output_mode == "COMPOSITE":
-        view_layers = [context.window.view_layer]
-    else:
-        view_layers = _resolve_view_layers(scene, settings.view_layers_filter)
+    view_layers = list(scene.view_layers)
 
     combos = []
     for vl in view_layers:
@@ -483,57 +481,37 @@ def _get_cloth_combos(context):
     return combos
 
 
-def _activate_cloth_paths(view_layer, action, context=None, direction_name=None):
+def _activate_cloth_paths(action, direction_name=None):
     """
-    For each cloth object in view_layer, switch mod's active PointCache slot to the
-    one dedicated to this (view_layer, action[, direction]) combo.
+    For each cloth object in any scene view layer, switch mod's active PointCache slot
+    to the one dedicated to this (view_layer, action[, direction]) combo.
     Returns a dict mapping (obj_name, mod_name) -> prev_slot_name for later restore.
-
-    In composite mode (view_layer is None), scans all scene view layers to find
-    which one holds the baked files for this action.
+    Slot names are view-layer-keyed (matching baked data) and independent of compositor names.
     direction_name is only set in OBJECT rotation mode (per-direction bakes).
     """
-    if context is None:
-        context = bpy.context
+    scene = bpy.context.scene
     saved = {}
-    if view_layer is None:
-        # Composite mode: scan all view layers to find which one has the bake.
-        scene = bpy.context.scene
-        claimed = set()
-        all_cloth_keys = set()
-        for vl in scene.view_layers:
-            for obj in _get_cloth_objects_in_layer(vl):
-                for mod in obj.modifiers:
-                    if mod.type != 'CLOTH':
-                        continue
-                    key = (obj.name, mod.name)
-                    all_cloth_keys.add(key)
-                    if key in claimed:
-                        continue
-                    if _is_combo_baked(vl.name, action.name, direction_name):
-                        claimed.add(key)
-                        saved[key] = mod.point_cache.name
-                        slot_name = RenderKey("", action.name, vl.name, direction_name or "").slot_name()
-                        if _activate_combo_slot(mod, slot_name):
-                            _log(f"  [cloth] slot activated: {obj.name}/{mod.name} -> '{slot_name}' (composite vl={vl.name})")
-                        else:
-                            _log(f"  [cloth] ERROR: slot '{slot_name}' not found for {obj.name}/{mod.name} (composite)")
-        for key in all_cloth_keys - claimed:
-            _log(f"  [cloth] ERROR: no baked cache found for {key[0]}/{key[1]} action={action.name} — cloth will not simulate correctly")
-        return saved
-    for obj in _get_cloth_objects_in_layer(view_layer):
-        for mod in obj.modifiers:
-            if mod.type != 'CLOTH':
-                continue
-            key = (obj.name, mod.name)
-            if not _is_combo_baked(view_layer.name, action.name, direction_name):
-                _log(f"  [cloth] ERROR: no baked cache found for {obj.name}/{mod.name} vl={view_layer.name} action={action.name} dir={direction_name} — cloth will not simulate correctly")
-            saved[key] = mod.point_cache.name
-            slot_name = RenderKey("", action.name, view_layer.name, direction_name or "").slot_name()
-            if _activate_combo_slot(mod, slot_name):
-                _log(f"  [cloth] slot activated: {obj.name}/{mod.name} -> '{slot_name}'")
-            else:
-                _log(f"  [cloth] ERROR: slot '{slot_name}' not found for {obj.name}/{mod.name}")
+    claimed = set()
+    all_cloth_keys = set()
+    for vl in scene.view_layers:
+        for obj in _get_cloth_objects_in_layer(vl):
+            for mod in obj.modifiers:
+                if mod.type != 'CLOTH':
+                    continue
+                key = (obj.name, mod.name)
+                all_cloth_keys.add(key)
+                if key in claimed:
+                    continue
+                if _is_combo_baked(vl.name, action.name, direction_name):
+                    claimed.add(key)
+                    saved[key] = mod.point_cache.name
+                    slot_name = RenderKey("", action.name, vl.name, direction_name or "").slot_name()
+                    if _activate_combo_slot(mod, slot_name):
+                        _log(f"  [cloth] slot activated: {obj.name}/{mod.name} -> '{slot_name}' (vl={vl.name})")
+                    else:
+                        _log(f"  [cloth] ERROR: slot '{slot_name}' not found for {obj.name}/{mod.name}")
+    for key in all_cloth_keys - claimed:
+        _log(f"  [cloth] ERROR: no baked cache found for {key[0]}/{key[1]} action={action.name} — cloth will not simulate correctly")
     return saved
 
 
@@ -666,15 +644,10 @@ def _build_job_queue(context, export_root):
     if not chr_actions:
         return None, "No actions to render (none in file or all excluded)"
 
-    composite_mode = settings.output_mode == "COMPOSITE"
-
-    if composite_mode:
-        layer_iter = [("composite", None)]  # (label, view_layer_object)
-    else:
-        view_layers = _resolve_view_layers(scene, settings.view_layers_filter)
-        if not view_layers:
-            return None, "No view layers to render"
-        layer_iter = [(vl.name, vl) for vl in view_layers]
+    compositors = _resolve_compositors(settings.compositors_filter)
+    if not compositors:
+        return None, "No compositor node groups to render"
+    compositor_iter = [(ng.name, ng) for ng in compositors]
 
     directions = _get_directions(settings.num_directions)
     frame_step = settings.frame_step
@@ -683,9 +656,7 @@ def _build_job_queue(context, export_root):
     scene_name = scene.name
 
     _log(f"Found {len(chr_actions)} action(s): {[a.name for a in chr_actions]}")
-    _log(f"Mode        : {'composite' if composite_mode else 'layered'}")
-    if not composite_mode:
-        _log(f"View layers : {[name for name, _ in layer_iter]}")
+    _log(f"Compositors : {[name for name, _ in compositor_iter]}")
     _log(f"Directions  : {[d[0] for d in directions]}  ({len(directions)})")
     _log(f"Frame step  : {frame_step}")
     _log(f"Overwrite   : {overwrite}")
@@ -700,9 +671,9 @@ def _build_job_queue(context, export_root):
         expected_frames = len(frames)
         action_jobs = []
         os.makedirs(export_root, exist_ok=True)
-        for layer_name, vl_obj in layer_iter:
+        for compositor_name, compositor_ng in compositor_iter:
             for direction_name, angle_radians in directions:
-                rkey = RenderKey(blendfile, action.name, layer_name, direction_name, scene_name)
+                rkey = RenderKey(blendfile, action.name, compositor_name, direction_name, scene_name)
                 if not overwrite and _count_existing_frames(
                         export_root, rkey.prefix()) >= expected_frames:
                     _log(f"  SKIP  {rkey.label()} ({expected_frames} frames exist)")
@@ -718,9 +689,8 @@ def _build_job_queue(context, export_root):
                         "type": "render",
                         "key": rkey,
                         "action": action,
-                        "vl_name": layer_name,
-                        "vl_object": vl_obj,
-                        "composite_mode": composite_mode,
+                        "compositor_name": compositor_name,
+                        "compositor_ng": compositor_ng,
                         "direction_name": direction_name,
                         "angle_radians": angle_radians,
                         "out_path": os.path.join(export_root, rkey.stem(frame) + ".png"),
@@ -815,19 +785,9 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         max=64,
         options=set(),
     )
-    output_mode: bpy.props.EnumProperty(  # type: ignore
-        name="Output Mode",
-        description="How to handle view layers during rendering",
-        items=[
-            ("LAYERED", "Layered", "Render each view layer separately using compositor node overrides"),
-            ("COMPOSITE", "Composite", "Render the full compositor output as-is — no layer separation"),
-        ],
-        default="LAYERED",
-        options=set(),
-    )
-    view_layers_filter: bpy.props.StringProperty(  # type: ignore
-        name="View Layers",
-        description="Comma-separated view layers to render. Leave blank to render all",
+    compositors_filter: bpy.props.StringProperty(  # type: ignore
+        name="Compositors",
+        description="Comma-separated compositor node group names to exclude. Leave blank to render all",
         default="",
         options=set(),
     )
@@ -865,25 +825,25 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
     )
     sheet_name_format: bpy.props.StringProperty(  # type: ignore
         name="Name Format",
-        description="Filename format for sprite sheets. Placeholders: {scene} {blendfile} {action} {layer} {direction}",
-        default="{blendfile}-{scene}-{layer}-{action}-{direction}",
+        description="Filename format for sprite sheets. Placeholders: {scene} {blendfile} {action} {compositor} {direction}",
+        default="{blendfile}-{scene}-{compositor}-{action}-{direction}",
         options=set(),
     )
     frame_name_format: bpy.props.StringProperty(  # type: ignore
         name="Frame Name Format",
-        description="Frame name used inside sprite sheet JSON. Placeholders: {scene} {blendfile} {action} {layer} {direction} {frame}",
-        default="{blendfile}-{scene}-{action}-{layer}-{direction}-{frame}",
+        description="Frame name used inside sprite sheet JSON. Placeholders: {scene} {blendfile} {action} {compositor} {direction} {frame}",
+        default="{blendfile}-{scene}-{action}-{compositor}-{direction}-{frame}",
         options=set(),
     )
     split_axes: bpy.props.EnumProperty(  # type: ignore
         name="File Splits",
         description="Generate a separate sprite sheet per selected axis",
         items=[
-            ('ACTION',    "Action",    "Separate sheet per action"),
-            ('LAYER',     "Layer",     "Separate sheet per view layer"),
-            ('DIRECTION', "Direction", "Separate sheet per direction"),
+            ('ACTION',      "Action",      "Separate sheet per action"),
+            ('COMPOSITOR',  "Compositor",  "Separate sheet per compositor"),
+            ('DIRECTION',   "Direction",   "Separate sheet per direction"),
         ],
-        default={'ACTION', 'LAYER'},
+        default={'ACTION', 'COMPOSITOR'},
         options={'ENUM_FLAG'},
         update=_on_split_axes_update,
     )
@@ -891,9 +851,9 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         name="Row Splits",
         description="Put each selected axis on its own row within a sheet",
         items=[
-            ('ACTION',    "Action",    "One row per action"),
-            ('LAYER',     "Layer",     "One row per view layer"),
-            ('DIRECTION', "Direction", "One row per direction"),
+            ('ACTION',      "Action",      "One row per action"),
+            ('COMPOSITOR',  "Compositor",  "One row per compositor"),
+            ('DIRECTION',   "Direction",   "One row per direction"),
         ],
         default={'DIRECTION'},
         options={'ENUM_FLAG'},
@@ -1246,10 +1206,9 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         if job["type"] == "bake":
             action = job["action"]
             settings = context.scene.spriteloom
-            context.scene.spriteloom.progress = f"Baking cloth: {action.name} / {job['vl_name']}…"
-            _log(f"=== Cloth rebake on render: '{action.name}' / '{job['vl_name']}' ===")
-            vl_obj = job.get("vl_object") or context.scene.view_layers.get(job["vl_name"])
-            if vl_obj:
+            context.scene.spriteloom.progress = f"Baking cloth: {action.name} / {job['compositor_name']}…"
+            _log(f"=== Cloth rebake on render: '{action.name}' / '{job['compositor_name']}' ===")
+            for vl_obj in context.scene.view_layers:
                 for obj in _get_cloth_objects_in_layer(vl_obj):
                     _bake_cloth_for_combo(context, obj, vl_obj, action, settings.cloth_warmup_frames)
             _log(f"=== Cloth rebake done ===")
@@ -1269,13 +1228,13 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         # In OBJECT mode, direction is part of the combo key (per-direction bakes).
         direction_name = job.get("direction_name")
         if settings.rotation_mode == "OBJECT":
-            combo_key = (job["vl_name"], action.name, direction_name)
+            combo_key = (job["compositor_name"], action.name, direction_name)
         else:
-            combo_key = (job["vl_name"], action.name)
+            combo_key = (job["compositor_name"], action.name)
         if combo_key != self._last_cloth_combo:
             _restore_cloth_paths(self._active_cloth_paths)
-            _log(f"[cloth] activating cache for combo: vl={job['vl_name']}, action={action.name}, dir={direction_name}")
-            self._active_cloth_paths = _activate_cloth_paths(job.get("vl_object"), action, direction_name=direction_name)
+            _log(f"[cloth] activating cache for combo: compositor={job['compositor_name']}, action={action.name}, dir={direction_name}")
+            self._active_cloth_paths = _activate_cloth_paths(action, direction_name=direction_name)
             self._last_cloth_combo = combo_key
 
         label = job["key"].label()
@@ -1313,29 +1272,17 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         orig_file_format = fmt.file_format
         orig_color_mode = fmt.color_mode
 
-        is_composite = job.get("composite_mode", False)
-
-        # In layered mode: point all R_LAYERS compositor nodes at the target view layer
-        nt = scene.compositing_node_group
-        rl_orig = {}
-        orig_window_vl = context.window.view_layer
-        if not is_composite and nt:
-            for node in nt.nodes:
-                if node.type == 'R_LAYERS':
-                    rl_orig[node.name] = node.layer
-                    node.layer = job["vl_name"]
-
-        if not is_composite:
-            target_vl = scene.view_layers.get(job["vl_name"])
-            if target_vl and orig_window_vl != target_vl:
-                _log(f"  [render] switching window view layer: '{orig_window_vl.name}' → '{target_vl.name}'")
-                context.window.view_layer = target_vl
+        orig_compositor = scene.compositing_node_group
+        compositor_ng = job.get("compositor_ng")
+        if compositor_ng:
+            scene.compositing_node_group = compositor_ng
 
         # Redirect the existing "Normal Output" File Output compositor node for this frame.
         # Blender writes {directory}/{node.file_name}{item.name}.ext with no auto frame
         # number. We set file_name to the full per-frame path and clear item.name:
-        #   action--layer--direction--n--0024.png  (5-part stem, same export dir as beauty)
-        #   action--layer--direction--0024.png      (4-part stem, beauty)
+        #   action--compositor--direction--n--0024.png  (5-part stem, same export dir as beauty)
+        #   action--compositor--direction--0024.png      (4-part stem, beauty)
+        nt = scene.compositing_node_group
         normal_node = None
         orig_normal_directory = orig_normal_file_name = orig_normal_item_name = orig_normal_fmt = None
         if settings.render_normals and nt:
@@ -1357,10 +1304,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             fmt.media_type = "IMAGE"
             fmt.file_format = "PNG"
             fmt.color_mode = "RGBA"
-            if is_composite:
-                bpy.ops.render.render("EXEC_DEFAULT", write_still=True)
-            else:
-                bpy.ops.render.render("EXEC_DEFAULT", write_still=True, layer=job["vl_name"])
+            bpy.ops.render.render("EXEC_DEFAULT", write_still=True)
             _log(f"    OK  saved={out_path}")
             self._rendered += 1
             if normal_node and settings.normal_correct_rotation:
@@ -1386,13 +1330,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             fmt.media_type = orig_media_type
             fmt.file_format = orig_file_format
             fmt.color_mode = orig_color_mode
-            if nt:
-                for node in nt.nodes:
-                    if node.type == 'R_LAYERS' and node.name in rl_orig:
-                        node.layer = rl_orig[node.name]
-            if context.window.view_layer != orig_window_vl:
-                _log(f"  [render] restoring window view layer to '{orig_window_vl.name}'")
-                context.window.view_layer = orig_window_vl
+            scene.compositing_node_group = orig_compositor
             if armature_obj.animation_data and armature_obj.animation_data.use_nla != orig_use_nla:
                 _log(f"  [render] restoring NLA on '{armature_obj.name}' to {orig_use_nla}")
                 armature_obj.animation_data.use_nla = orig_use_nla
@@ -1581,28 +1519,29 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         row.prop(settings, "show_output", icon="TRIA_DOWN" if settings.show_output else "TRIA_RIGHT", emboss=False, text="Output", icon_only=False)
         row.label(icon="FILE_FOLDER")
         if settings.show_output:
-            row = box.row(align=True)
-            row.label(text="Mode:")
-            row.prop(settings, "output_mode", expand=True)
-
-            if settings.output_mode == "LAYERED":
-                layers_box = box.box()
-                layers_box.label(text="View Layers", icon="RENDERLAYERS")
-                excluded = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()}
-                col = layers_box.column(align=True)
+            comp_groups = [ng for ng in bpy.data.node_groups if ng.type == 'COMPOSITING']
+            comp_box = box.box()
+            comp_box.label(text="Compositors", icon="NODE_COMPOSITING")
+            if comp_groups:
+                excluded = {s.strip() for s in settings.compositors_filter.split(",") if s.strip()}
+                col = comp_box.column(align=True)
                 col.scale_y = 0.75
-                for vl in scene.view_layers:
-                    is_on = vl.name not in excluded
+                for ng in comp_groups:
+                    is_on = ng.name not in excluded
                     row = col.row(align=True)
-                    op = row.operator("spriteloom.toggle_view_layer",
-                                       text=vl.name,
-                                       icon='CHECKBOX_HLT' if is_on else 'CHECKBOX_DEHLT',
-                                       emboss=False)
-                    op.layer_name = vl.name
-                    act = row.operator("spriteloom.activate_view_layer", text="", icon='LINKED', emboss=False)
-                    act.layer_name = vl.name
+                    op = row.operator("spriteloom.toggle_compositor",
+                                      text=ng.name,
+                                      icon='CHECKBOX_HLT' if is_on else 'CHECKBOX_DEHLT',
+                                      emboss=False)
+                    op.compositor_name = ng.name
+                    nav = row.operator("spriteloom.focus_compositor", text="", icon='LINKED', emboss=False)
+                    nav.compositor_name = ng.name
+                    if not ng.use_fake_user:
+                        warn = row.row()
+                        warn.alert = True
+                        warn.label(text="", icon='ERROR')
             else:
-                box.label(text="Renders compositor output as-is. Set up compositing in Blender.", icon='INFO')
+                comp_box.label(text="No COMPOSITING node groups found", icon='ERROR')
 
             box.prop(settings, "export_root")
             box.prop(settings, "spritesheet_root")
@@ -1623,12 +1562,12 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             row = box.row(align=True)
             row.label(text="File splits:")
             row.prop_enum(settings, "split_axes", 'ACTION')
-            row.prop_enum(settings, "split_axes", 'LAYER')
+            row.prop_enum(settings, "split_axes", 'COMPOSITOR')
             row.prop_enum(settings, "split_axes", 'DIRECTION')
             row = box.row(align=True)
             row.label(text="Row splits:")
             row.prop_enum(settings, "row_split_axes", 'ACTION')
-            row.prop_enum(settings, "row_split_axes", 'LAYER')
+            row.prop_enum(settings, "row_split_axes", 'COMPOSITOR')
             row.prop_enum(settings, "row_split_axes", 'DIRECTION')
 
             box.separator(factor=0.5)
@@ -1641,32 +1580,29 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.prop(settings, "sheet_name_format")
             col = box.column(align=True)
             col.scale_y = 0.7
-            col.label(text="{scene}  {blendfile}  {action}  {layer}  {direction}", icon='INFO')
+            col.label(text="{scene}  {blendfile}  {action}  {compositor}  {direction}", icon='INFO')
 
             box.separator(factor=0.3)
             box.prop(settings, "frame_name_format")
             col = box.column(align=True)
             col.scale_y = 0.7
-            col.label(text="{scene}  {blendfile}  {action}  {layer}  {direction}  {frame}", icon='INFO')
+            col.label(text="{scene}  {blendfile}  {action}  {compositor}  {direction}  {frame}", icon='INFO')
 
             box.separator(factor=0.5)
             box.label(text="Example output:")
             blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
             _ex_excluded = {n.strip() for n in settings.actions_filter.split(",") if n.strip()}
             example_actions = [a.name for a in bpy.data.actions if a.name not in _ex_excluded] or ["chr_walk", "chr_idle"]
-            if settings.output_mode == "COMPOSITE":
-                example_layers = ["composite"]
-            else:
-                example_layers = [vl.name for vl in _resolve_view_layers(scene, settings.view_layers_filter)] or ["Layer"]
+            example_compositors = [ng.name for ng in _resolve_compositors(settings.compositors_filter)] or ["compositor"]
             example_directions = [d[0] for d in _get_directions(settings.num_directions)]
             seen = []
             for action in example_actions:
-                for layer in example_layers:
+                for layer in example_compositors:
                     for direction in (example_directions if 'DIRECTION' in settings.split_axes else [""]):
                         key = RenderKey(
                             blendfile=blendfile,
                             action_name=action,
-                            layer_name=layer,
+                            compositor_name=layer,
                             direction_name=direction,
                             scene_name=scene.name,
                         )
@@ -1683,11 +1619,11 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
 
             box.separator(factor=0.3)
             box.label(text="Example frame:")
-            if example_actions and example_layers and example_directions:
+            if example_actions and example_compositors and example_directions:
                 ex_key = RenderKey(
                     blendfile=blendfile,
                     action_name=example_actions[0],
-                    layer_name=example_layers[0],
+                    compositor_name=example_compositors[0],
                     direction_name=example_directions[0],
                     scene_name=scene.name,
                 )
@@ -1711,10 +1647,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             if bpy.data.actions:
                 issues.append(("INFO", "Hint: uncheck at least one action above"))
 
-        if settings.output_mode == "LAYERED":
-            active_layers = _resolve_view_layers(scene, settings.view_layers_filter)
-            if not active_layers:
-                issues.append(("ERROR", "No view layers to render"))
+        if not _resolve_compositors(settings.compositors_filter):
+            issues.append(("ERROR", "No compositor node groups to render"))
 
         if not _resolve_path(settings.export_root):
             issues.append(("ERROR", "Export path is relative — save the .blend file first"))
@@ -1856,12 +1790,7 @@ class SPRITELOOM_OT_RenderVideoPreview(bpy.types.Operator):
         video_path = os.path.join(preview_dir, f"{action.name}_preview.mp4")
 
         # Activate pre-baked cloth cache paths for this action
-        if settings.output_mode == "COMPOSITE":
-            vl_for_cloth = context.window.view_layer
-        else:
-            active_vls = _resolve_view_layers(scene, settings.view_layers_filter)
-            vl_for_cloth = active_vls[0] if active_vls else None
-        saved_cloth = _activate_cloth_paths(vl_for_cloth, action)
+        saved_cloth = _activate_cloth_paths(action)
 
         # Save render state
         orig_filepath = scene.render.filepath
@@ -1941,19 +1870,22 @@ class SPRITELOOM_OT_FocusAction(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class SPRITELOOM_OT_ActivateViewLayer(bpy.types.Operator):
-    """Set this as the active view layer"""
-    bl_idname = "spriteloom.activate_view_layer"
-    bl_label = "Activate View Layer"
+class SPRITELOOM_OT_FocusCompositor(bpy.types.Operator):
+    """Set this compositor on the scene and switch to the Compositing workspace"""
+    bl_idname = "spriteloom.focus_compositor"
+    bl_label = "Focus Compositor"
 
-    layer_name: bpy.props.StringProperty()  # type: ignore
+    compositor_name: bpy.props.StringProperty()  # type: ignore
 
     def execute(self, context):
-        vl = context.scene.view_layers.get(self.layer_name)
-        if not vl:
-            self.report({'WARNING'}, f"View layer not found: {self.layer_name}")
+        ng = bpy.data.node_groups.get(self.compositor_name)
+        if not ng:
+            self.report({'WARNING'}, f"Node group not found: {self.compositor_name}")
             return {'CANCELLED'}
-        context.window.view_layer = vl
+        context.scene.compositing_node_group = ng
+        ws = bpy.data.workspaces.get("Compositing")
+        if ws:
+            context.window.workspace = ws
         return {'FINISHED'}
 
 
@@ -2018,22 +1950,22 @@ class SPRITELOOM_OT_ToggleAction(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class SPRITELOOM_OT_ToggleViewLayer(bpy.types.Operator):
-    """Toggle a view layer on/off for rendering"""
-    bl_idname = "spriteloom.toggle_view_layer"
-    bl_label = "Toggle View Layer"
+class SPRITELOOM_OT_ToggleCompositor(bpy.types.Operator):
+    """Toggle a compositor node group on/off for rendering"""
+    bl_idname = "spriteloom.toggle_compositor"
+    bl_label = "Toggle Compositor"
 
-    layer_name: bpy.props.StringProperty()  # type: ignore
+    compositor_name: bpy.props.StringProperty()  # type: ignore
 
     def execute(self, context):
         settings = context.scene.spriteloom
-        all_layers = [vl.name for vl in context.scene.view_layers]
-        excluded = {n.strip() for n in settings.view_layers_filter.split(",") if n.strip()}
-        if self.layer_name in excluded:
-            excluded.discard(self.layer_name)
+        all_names = [ng.name for ng in bpy.data.node_groups if ng.type == 'COMPOSITING']
+        excluded = {s.strip() for s in settings.compositors_filter.split(",") if s.strip()}
+        if self.compositor_name in excluded:
+            excluded.discard(self.compositor_name)
         else:
-            excluded.add(self.layer_name)
-        settings.view_layers_filter = ", ".join(n for n in all_layers if n in excluded)
+            excluded.add(self.compositor_name)
+        settings.compositors_filter = ", ".join(n for n in all_names if n in excluded)
         return {'FINISHED'}
 
 
@@ -2042,9 +1974,9 @@ _classes = (
     SPRITELOOM_OT_RenderAll,
     SPRITELOOM_OT_RenderVideoPreview,
     SPRITELOOM_OT_FocusAction,
-    SPRITELOOM_OT_ActivateViewLayer,
     SPRITELOOM_OT_ToggleAction,
-    SPRITELOOM_OT_ToggleViewLayer,
+    SPRITELOOM_OT_ToggleCompositor,
+    SPRITELOOM_OT_FocusCompositor,
     SPRITELOOM_OT_PreviewDirection,
     SPRITELOOM_OT_ResetCameraDirection,
     SPRITELOOM_OT_BakeCloth,

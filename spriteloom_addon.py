@@ -184,14 +184,17 @@ class RenderKey:
             name = "-".join(p for p in parts if p)
         return name or "spritesheet"
 
-    def frame_name(self, fmt: str, frame: int, padding: int = 2) -> str:
+    def frame_name(self, fmt: str, frame: int, padding: int = 2, tag: str = "") -> str:
         scene_display = self._scene_display()
         name = (fmt or "").replace("{scene}",      scene_display) \
                           .replace("{blendfile}",  self.blendfile) \
                           .replace("{action}",     self.action_name) \
                           .replace("{compositor}", self.compositor_name) \
                           .replace("{direction}",  self.direction_name) \
+                          .replace("{tag}",        tag) \
                           .replace("{frame}",      str(frame).zfill(padding))
+        import re
+        name = re.sub(r'[-_]{2,}', '-', name)  # collapse double separators from empty {tag}
         name = name.strip("-_ ")
         return name or f"{self.action_name}--{self.compositor_name}--{self.direction_name}--{str(frame).zfill(padding)}"
 
@@ -288,13 +291,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             sheet_arr[y_px:y_px + FRAME_HEIGHT, x_px:x_px + FRAME_WIDTH, :] = arr[:FRAME_HEIGHT, :FRAME_WIDTH, :]
 
             display_num = frame_index_map[id(f)] if renumber_frames else f["frame_num"]
-            sprite_name = f["key"].frame_name(frame_name_format or "", display_num, padding=frame_num_padding)
-            if not frame_name_format:
-                # default: [blendfile_][scene_]action_compositor_direction[_tag]_NN
-                tag_part = f"_{frame_tag}" if frame_tag else ""
-                blend_prefix = f"{f['key'].blendfile}_" if f["key"].blendfile else ""
-                scene_prefix = f"{f['key']._scene_display()}_" if f["key"]._scene_display() else ""
-                sprite_name = f"{blend_prefix}{scene_prefix}{f['key'].action_name}_{f['key'].compositor_name}_{f['key'].direction_name}{tag_part}_{display_num:0{frame_num_padding}d}"
+            sprite_name = f["key"].frame_name(frame_name_format or "", display_num, padding=frame_num_padding, tag=frame_tag or "")
             frames_meta[sprite_name] = {
                 "frame": {"x": x_px, "y": sheet_h - y_px - FRAME_HEIGHT, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
                 "rotated": False,
@@ -844,14 +841,14 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
     )
     sheet_name_format: bpy.props.StringProperty(  # type: ignore
         name="Name Format",
-        description="Filename format for sprite sheets. Placeholders: {scene} {blendfile} {action} {compositor} {direction}",
+        description="Sprite sheet filename format. {action}: action name · {compositor}: compositor node group · {direction}: render direction · {scene}: scene name · {blendfile}: blend file stem",
         default="{blendfile}-{scene}-{compositor}-{action}-{direction}",
         options=set(),
     )
     frame_name_format: bpy.props.StringProperty(  # type: ignore
         name="Frame Name Format",
-        description="Frame name used inside sprite sheet JSON. Placeholders: {scene} {blendfile} {action} {compositor} {direction} {frame}",
-        default="{blendfile}-{scene}-{action}-{compositor}-{direction}-{frame}",
+        description="Frame name inside sprite sheet JSON. {action}: action name · {compositor}: compositor node group · {direction}: render direction · {scene}: scene name · {blendfile}: blend file stem · {tag}: pass tag (empty for beauty, e.g. n for normals) · {frame}: zero-padded frame number",
+        default="{blendfile}-{scene}-{action}-{compositor}-{direction}-{tag}-{frame}",
         options=set(),
     )
     split_axes: bpy.props.EnumProperty(  # type: ignore
@@ -1596,19 +1593,9 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             sub.prop(settings, "frame_num_padding")
 
             box.separator(factor=0.5)
-            box.prop(settings, "sheet_name_format")
-            col = box.column(align=True)
-            col.scale_y = 0.7
-            col.label(text="{scene}  {blendfile}  {action}  {compositor}  {direction}", icon='INFO')
+            box.label(text="Name Format:")
+            box.prop(settings, "sheet_name_format", text="")
 
-            box.separator(factor=0.3)
-            box.prop(settings, "frame_name_format")
-            col = box.column(align=True)
-            col.scale_y = 0.7
-            col.label(text="{scene}  {blendfile}  {action}  {compositor}  {direction}  {frame}", icon='INFO')
-
-            box.separator(factor=0.5)
-            box.label(text="Example output:")
             blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
             _ex_inc = _parse_include(settings.actions_include)
             example_actions = [a.name for a in bpy.data.actions if _ex_inc is None or a.name in _ex_inc] or ["chr_walk", "chr_idle"]
@@ -1630,14 +1617,16 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                         if name not in seen:
                             seen.append(name)
             col = box.column(align=True)
-            col.scale_y = 0.75
+            col.scale_y = 0.7
             for name in seen[:5]:
                 col.label(text=f"{name}.png", icon='FILE_IMAGE')
             if len(seen) > 5:
                 col.label(text=f"+{len(seen) - 5} more…", icon='BLANK1')
 
             box.separator(factor=0.3)
-            box.label(text="Example frame:")
+            box.label(text="Frame Name Format:")
+            box.prop(settings, "frame_name_format", text="")
+
             if example_actions and example_compositors and example_directions:
                 ex_key = RenderKey(
                     blendfile=blendfile,
@@ -1648,7 +1637,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 )
                 ex_frame = ex_key.frame_name(settings.frame_name_format, 1, padding=settings.frame_num_padding)
                 col = box.column(align=True)
-                col.scale_y = 0.75
+                col.scale_y = 0.7
                 col.label(text=ex_frame, icon='FILE_IMAGE')
 
         # --- Validation warnings ---
@@ -2007,6 +1996,7 @@ class SPRITELOOM_OT_ToggleCompositor(bpy.types.Operator):
         else:
             settings.compositors_include = ", ".join(n for n in all_names if n in included)
         return {'FINISHED'}
+
 
 
 _classes = (

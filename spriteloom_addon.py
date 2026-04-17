@@ -106,6 +106,15 @@ def _resolve_compositors(filter_str):
     return groups
 
 
+def _prefix_filtered(items, get_name, filter_text, filter_enabled, is_default=False, scene_name=""):
+    if not filter_enabled:
+        return items
+    prefix = (scene_name if is_default else filter_text).strip().lower()
+    if not prefix:
+        return items
+    return [item for item in items if get_name(item).lower().startswith(prefix)]
+
+
 def _resolve_path(prop_value):
     """Return an absolute path. Supports // Blender-relative paths. Returns '' if unresolvable."""
     if not prop_value:
@@ -225,7 +234,7 @@ def _row_key(f, row_split_axes: set):
 def _pack_sheet(np, spritesheet_root, sheet_name, frames,
                 row_split_axes: set,
                 renumber_frames=True, frame_num_padding=2, frame_tag=None, blendfile="",
-                frame_name_format=None):
+                frame_name_format=None, write_json=True):
     """
     Pack a list of frame dicts into one sprite sheet, optionally split into rows.
     Each frame dict: {"filepath": str, "action": str, "layer": str, "direction": str, "frame_num": int}
@@ -323,12 +332,13 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             "scale": "1",
         },
     }
-    try:
-        with open(sheet_json, "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
-    except Exception as exc:
-        _log(f"  ERROR writing {sheet_json}: {exc}")
-        return False
+    if write_json:
+        try:
+            with open(sheet_json, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+        except Exception as exc:
+            _log(f"  ERROR writing {sheet_json}: {exc}")
+            return False
 
     return True
 
@@ -338,7 +348,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
 def _run_pack(export_root, spritesheet_root, sheet_name_format,
               split_axes: set, row_split_axes: set,
               renumber_frames=True, frame_num_padding=2,
-              frame_tag=None, frame_name_format=None):
+              frame_tag=None, frame_name_format=None, write_json=True):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors).
 
     frame_tag: sanitized tag string (no dashes, e.g. 'n'). When set, only 5-part stems are
@@ -390,7 +400,7 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
         if _pack_sheet(np, spritesheet_root, sheet_name, frames,
                        row_split_axes,
                        renumber_frames, frame_num_padding, frame_tag=frame_tag,
-                       frame_name_format=frame_name_format):
+                       frame_name_format=frame_name_format, write_json=write_json):
             generated += 1
         else:
             errors += 1
@@ -807,6 +817,42 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         default="",
         options=set(),
     )
+    actions_prefix_filter: bpy.props.StringProperty(  # type: ignore
+        name="Actions Filter",
+        description="Prefix filter for the actions list",
+        default="",
+        options=set(),
+    )
+    actions_prefix_filter_enabled: bpy.props.BoolProperty(  # type: ignore
+        name="Filter Actions",
+        description="Show only actions whose names start with the filter prefix",
+        default=True,
+        options=set(),
+    )
+    actions_prefix_is_default: bpy.props.BoolProperty(  # type: ignore
+        name="Use Scene Name",
+        description="Use the current scene name as the filter prefix (stays in sync with scene renames)",
+        default=True,
+        options=set(),
+    )
+    compositors_prefix_filter: bpy.props.StringProperty(  # type: ignore
+        name="Compositors Filter",
+        description="Prefix filter for the compositors list",
+        default="",
+        options=set(),
+    )
+    compositors_prefix_filter_enabled: bpy.props.BoolProperty(  # type: ignore
+        name="Filter Compositors",
+        description="Show only compositors whose names start with the filter prefix",
+        default=True,
+        options=set(),
+    )
+    compositors_prefix_is_default: bpy.props.BoolProperty(  # type: ignore
+        name="Use Scene Name",
+        description="Use the current scene name as the filter prefix (stays in sync with scene renames)",
+        default=True,
+        options=set(),
+    )
     rebake_on_render: bpy.props.BoolProperty(  # type: ignore
         name="Rebake on Render",
         description="Automatically rebake all cloth combos before each render run",
@@ -922,6 +968,12 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         name="Normal Tag",
         description="Tag used to identify normal map files (dashes are stripped; e.g. 'n' → action--layer--direction--n--0024.png)",
         default="n",
+        options=set(),
+    )
+    normal_write_json: bpy.props.BoolProperty(  # type: ignore
+        name="Write JSON",
+        description="Write a sprite sheet JSON metadata file alongside each normal map sprite sheet",
+        default=False,
         options=set(),
     )
     normal_correct_rotation: bpy.props.BoolProperty(  # type: ignore
@@ -1416,6 +1468,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 set(settings.split_axes), set(settings.row_split_axes),
                 settings.renumber_frames, settings.frame_num_padding,
                 frame_tag=normal_tag, frame_name_format=settings.frame_name_format,
+                write_json=settings.normal_write_json,
             )
             _log(f"=== Normal pack complete — {n_packed} generated, {n_skipped} skipped, {n_errors} errors ===")
             total_errors += n_errors
@@ -1462,13 +1515,25 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.prop(settings, "num_directions")
             box.prop(settings, "frame_step")
             actions_box = box.box()
-            actions_box.label(text="Actions", icon="ACTION")
+            hrow = actions_box.row(align=False)
+            hrow.label(text="Actions", icon="ACTION")
+            rhs = hrow.row(align=True)
+            rhs.alignment = 'RIGHT'
+            if settings.actions_prefix_is_default:
+                rhs.label(text=scene.name)
+            else:
+                rhs.prop(settings, "actions_prefix_filter", text="")
+            rhs.prop(settings, "actions_prefix_is_default", text="", toggle=True, icon='LINKED')
+            rhs.prop(settings, "actions_prefix_filter_enabled", text="", toggle=True, icon='FILTER')
             all_actions = list(bpy.data.actions)
-            if all_actions:
+            display_actions = _prefix_filtered(all_actions, lambda a: a.name,
+                settings.actions_prefix_filter, settings.actions_prefix_filter_enabled,
+                settings.actions_prefix_is_default, scene.name)
+            if display_actions:
                 _inc_actions = _parse_include(settings.actions_include)
                 col = actions_box.column(align=True)
                 col.scale_y = 0.75
-                for a in all_actions:
+                for a in display_actions:
                     frame_start = int(a.frame_range[0])
                     frame_end = int(a.frame_range[1])
                     loop_end = frame_end if a.use_cyclic else frame_end + 1
@@ -1487,6 +1552,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                         warn = row.row()
                         warn.alert = True
                         warn.label(text="", icon='ERROR')
+            elif all_actions:
+                actions_box.label(text="All actions filtered out", icon='INFO')
             else:
                 actions_box.label(text="No actions in file", icon='INFO')
         # --- Cloth Simulation ---
@@ -1537,12 +1604,24 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         if settings.show_output:
             comp_groups = [ng for ng in bpy.data.node_groups if ng.type == 'COMPOSITING']
             comp_box = box.box()
-            comp_box.label(text="Compositors", icon="NODE_COMPOSITING")
-            if comp_groups:
+            hrow = comp_box.row(align=False)
+            hrow.label(text="Compositors", icon="NODE_COMPOSITING")
+            rhs = hrow.row(align=True)
+            rhs.alignment = 'RIGHT'
+            if settings.compositors_prefix_is_default:
+                rhs.label(text=scene.name)
+            else:
+                rhs.prop(settings, "compositors_prefix_filter", text="")
+            rhs.prop(settings, "compositors_prefix_is_default", text="", toggle=True, icon='LINKED')
+            rhs.prop(settings, "compositors_prefix_filter_enabled", text="", toggle=True, icon='FILTER')
+            display_comps = _prefix_filtered(comp_groups, lambda ng: ng.name,
+                settings.compositors_prefix_filter, settings.compositors_prefix_filter_enabled,
+                settings.compositors_prefix_is_default, scene.name)
+            if display_comps:
                 _inc_comps = _parse_include(settings.compositors_include)
                 col = comp_box.column(align=True)
                 col.scale_y = 0.75
-                for ng in comp_groups:
+                for ng in display_comps:
                     is_on = _inc_comps is None or ng.name in _inc_comps
                     row = col.row(align=True)
                     op = row.operator("spriteloom.toggle_compositor",
@@ -1556,6 +1635,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                         warn = row.row()
                         warn.alert = True
                         warn.label(text="", icon='ERROR')
+            elif comp_groups:
+                comp_box.label(text="All compositors filtered out", icon='INFO')
             else:
                 comp_box.label(text="No COMPOSITING node groups found", icon='ERROR')
 
@@ -1568,6 +1649,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             if settings.render_normals:
                 row.prop(settings, "normal_tag", text="Tag")
                 row.prop(settings, "normal_correct_rotation", text="Correct Rotation", toggle=True)
+                row.prop(settings, "normal_write_json", text="Write JSON", toggle=True)
 
         # --- Sheet Layout ---
         box = layout.box()

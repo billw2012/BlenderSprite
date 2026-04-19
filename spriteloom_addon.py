@@ -1121,6 +1121,8 @@ class SPRITELOOM_OT_DeleteBakes(bpy.types.Operator):
 
         combos = _get_cloth_combos(context)
         deleted_files = 0
+
+        # Delete cache files on disk
         for _, vl, action in combos:
             slot_name = RenderKey("", action.name, vl.name, "").slot_name()
             prefix = slot_name + "_"
@@ -1129,7 +1131,33 @@ class SPRITELOOM_OT_DeleteBakes(bpy.types.Operator):
                     os.remove(os.path.join(cache_dir, f))
                     deleted_files += 1
 
-        self.report({"INFO"}, f"Deleted {deleted_files} cache file(s) from blendcache dir")
+        # Remove all named SpriteLoom slots from every cloth modifier in the scene.
+        # Use scene.objects (not combos) so hide_render objects aren't skipped.
+        removed_slots = 0
+        original_active = context.view_layer.objects.active
+        visited_mods = set()
+        for obj in context.scene.objects:
+            if not any(m.type == 'CLOTH' for m in obj.modifiers):
+                continue
+            context.view_layer.objects.active = obj
+            for mod in obj.modifiers:
+                if mod.type != 'CLOTH' or id(mod) in visited_mods:
+                    continue
+                visited_mods.add(id(mod))
+                pcs = mod.point_cache.point_caches
+                for i in range(len(pcs) - 1, -1, -1):
+                    if not pcs[i].name:
+                        continue  # leave the default unnamed slot
+                    pcs.active_index = i
+                    with context.temp_override(active_object=obj, point_cache=mod.point_cache):
+                        bpy.ops.ptcache.remove()
+                    removed_slots += 1
+                if len(pcs) == 0:
+                    with context.temp_override(active_object=obj, point_cache=mod.point_cache):
+                        bpy.ops.ptcache.add()
+        context.view_layer.objects.active = original_active
+
+        self.report({"INFO"}, f"Deleted {deleted_files} cache file(s), removed {removed_slots} slot(s)")
         for area in context.screen.areas:
             area.tag_redraw()
         return {"FINISHED"}

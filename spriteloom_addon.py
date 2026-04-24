@@ -995,7 +995,7 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
     bl_label = "Bake Cloth"
     bl_options = {"REGISTER"}
 
-    mode: bpy.props.StringProperty(default="missing")  # type: ignore  # "missing", "all", "single"
+    replace_existing: bpy.props.BoolProperty(default=True)  # type: ignore
     obj_name: bpy.props.StringProperty(default="")  # type: ignore
     vl_name: bpy.props.StringProperty(default="")  # type: ignore
     action_name: bpy.props.StringProperty(default="")  # type: ignore
@@ -1005,6 +1005,7 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
     _job_index = 0
     _orig_action = None
     _orig_window_vl = None
+    _orig_rig_z = None
 
     def execute(self, context):
         settings = context.scene.spriteloom
@@ -1013,20 +1014,34 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
             self.report({"ERROR"}, "Save the .blend file first — cloth caches are stored relative to it")
             return {"CANCELLED"}
 
-        combos = _get_cloth_combos(context)
-        if self.mode == "single":
-            combos = [
-                (obj, vl, a) for obj, vl, a in combos
+        base_combos = _get_cloth_combos(context)
+
+        # Filter to single combo when obj_name is set (per-row button)
+        if self.obj_name:
+            base_combos = [
+                (obj, vl, a) for obj, vl, a in base_combos
                 if obj.name == self.obj_name and vl.name == self.vl_name and a.name == self.action_name
             ]
-        elif self.mode == "missing":
-            combos = [
-                (obj, vl, a) for obj, vl, a in combos
-                if not _is_combo_baked(vl.name, a.name)
-            ]
-        # "all" uses all combos unfiltered
 
-        if not combos:
+        # Build (obj, vl, action, direction_name, angle_radians) job tuples
+        if settings.rotation_mode == "OBJECT":
+            directions = _get_directions(settings.num_directions)
+            all_jobs = [
+                (obj, vl, action, dir_name, angle)
+                for dir_name, angle in directions
+                for obj, vl, action in base_combos
+            ]
+        else:
+            all_jobs = [(obj, vl, action, None, 0.0) for obj, vl, action in base_combos]
+
+        # Filter already-baked combos when not replacing existing
+        if not self.replace_existing:
+            all_jobs = [
+                job for job in all_jobs
+                if not _is_combo_baked(job[1].name, job[2].name, job[3])
+            ]
+
+        if not all_jobs:
             self.report({"INFO"}, "Nothing to bake — all combos already baked")
             for area in context.screen.areas:
                 area.tag_redraw()
@@ -1035,9 +1050,10 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
         armature = settings.armature
         self._orig_action = armature.animation_data.action if (armature and armature.animation_data) else None
         self._orig_window_vl = context.window.view_layer
-        self._jobs = combos
+        self._orig_rig_z = settings.rotation_rig.rotation_euler.z if settings.rotation_rig else None
+        self._jobs = all_jobs
         self._job_index = 0
-        settings.progress = f"Baking cloth (0/{len(combos)})…"
+        settings.progress = f"Baking cloth (0/{len(all_jobs)})…"
         settings.progress_factor = 0.0
 
         self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
@@ -1057,16 +1073,21 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
         if self._job_index >= len(self._jobs):
             return self._finish(context)
 
-        obj, vl, action = self._jobs[self._job_index]
+        obj, vl, action, direction_name, angle_radians = self._jobs[self._job_index]
         settings = context.scene.spriteloom
         total = len(self._jobs)
-        settings.progress = f"Baking: {obj.name} / {vl.name} / {action.name} ({self._job_index + 1}/{total})"
+        dir_info = f" dir={direction_name}" if direction_name else ""
+        settings.progress = f"Baking: {obj.name}/{action.name}{dir_info} ({self._job_index + 1}/{total})"
         settings.progress_factor = self._job_index / total
+
+        rotation_rig = settings.rotation_rig
+        if settings.rotation_mode == "OBJECT" and rotation_rig and direction_name:
+            rotation_rig.rotation_euler.z = -angle_radians
 
         # NOTE: ptcache.bake(bake=True) is a blocking call — UI is unresponsive
         # during each simulation, which can take seconds to minutes.
-        _log(f"=== BakeCloth: '{obj.name}' / '{vl.name}' / '{action.name}' ===")
-        _bake_cloth_for_combo(context, obj, vl, action, settings.cloth_warmup_frames)
+        _log(f"=== BakeCloth: '{obj.name}' / '{vl.name}' / '{action.name}'{dir_info} ===")
+        _bake_cloth_for_combo(context, obj, vl, action, settings.cloth_warmup_frames, direction_name=direction_name)
         _log(f"=== BakeCloth done ===")
 
         self._job_index += 1
@@ -1085,6 +1106,9 @@ class SPRITELOOM_OT_BakeCloth(bpy.types.Operator):
         # Restore window view layer
         if self._orig_window_vl is not None:
             context.window.view_layer = self._orig_window_vl
+        # Restore rotation rig angle
+        if settings.rotation_rig and self._orig_rig_z is not None:
+            settings.rotation_rig.rotation_euler.z = self._orig_rig_z
 
         done = self._job_index
         total = len(self._jobs)
@@ -1131,31 +1155,34 @@ class SPRITELOOM_OT_DeleteBakes(bpy.types.Operator):
                     os.remove(os.path.join(cache_dir, f))
                     deleted_files += 1
 
-        # Remove all named SpriteLoom slots from every cloth modifier in the scene.
-        # Use scene.objects (not combos) so hide_render objects aren't skipped.
+        # Remove all SpriteLoom slots from every cloth modifier.
+        # Strategy: free bake on every slot first, then remove all but slot 0,
+        # then clear slot 0's name. ptcache.remove() can't remove the last slot.
         removed_slots = 0
-        original_active = context.view_layer.objects.active
         visited_mods = set()
         for obj in context.scene.objects:
-            if not any(m.type == 'CLOTH' for m in obj.modifiers):
-                continue
-            context.view_layer.objects.active = obj
             for mod in obj.modifiers:
-                if mod.type != 'CLOTH' or id(mod) in visited_mods:
+                mod_key = (obj.name, mod.name)
+                if mod.type != 'CLOTH' or mod_key in visited_mods:
                     continue
-                visited_mods.add(id(mod))
+                visited_mods.add(mod_key)
                 pcs = mod.point_cache.point_caches
-                for i in range(len(pcs) - 1, -1, -1):
-                    if not pcs[i].name:
-                        continue  # leave the default unnamed slot
-                    pcs.active_index = i
-                    with context.temp_override(active_object=obj, point_cache=mod.point_cache):
+                # Free bake data on every slot (deletes disk files for each)
+                for i in range(len(pcs)):
+                    if pcs[i].is_baked or pcs[i].name:
+                        pcs.active_index = i
+                        with context.temp_override(point_cache=mod.point_cache):
+                            bpy.ops.ptcache.free_bake()
+                # Remove extra slots highest-to-lowest, leaving only slot 0
+                while len(pcs) > 1:
+                    pcs.active_index = len(pcs) - 1
+                    with context.temp_override(point_cache=mod.point_cache):
                         bpy.ops.ptcache.remove()
                     removed_slots += 1
-                if len(pcs) == 0:
-                    with context.temp_override(active_object=obj, point_cache=mod.point_cache):
-                        bpy.ops.ptcache.add()
-        context.view_layer.objects.active = original_active
+                # Clear name on the mandatory last slot
+                if pcs[0].name:
+                    pcs[0].name = ""
+                removed_slots += 1
 
         self.report({"INFO"}, f"Deleted {deleted_files} cache file(s), removed {removed_slots} slot(s)")
         for area in context.screen.areas:
@@ -1215,52 +1242,46 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     removed += 1
             _log(f"Clean: removed {removed} file(s) from {self._export_root}")
 
+        bake_jobs = []
         if settings.rebake_on_render:
             combos = _get_cloth_combos(context)
-            orig_action = settings.armature.animation_data.action if (settings.armature and settings.armature.animation_data) else None
-            orig_vl = context.window.view_layer
-            rotation_rig = settings.rotation_rig
-            orig_rig_z = rotation_rig.rotation_euler.z if rotation_rig else None
-
             if settings.rotation_mode == "OBJECT":
-                # In OBJECT mode the character rotates in world space, so cloth
-                # simulation differs per direction — bake each combo per direction.
                 directions = _get_directions(settings.num_directions)
-                total_bakes = len(combos) * len(directions)
-                bake_idx = 0
+                total = len(combos) * len(directions)
+                idx = 0
                 for direction_name, angle_radians in directions:
-                    if rotation_rig:
-                        rotation_rig.rotation_euler.z = -angle_radians
                     for obj, vl, action in combos:
-                        bake_idx += 1
-                        settings.progress = f"Baking cloth dir={direction_name} ({bake_idx}/{total_bakes})…"
-                        settings.progress_factor = bake_idx / max(total_bakes, 1)
-                        for area in context.screen.areas:
-                            area.tag_redraw()
-                        _bake_cloth_for_combo(context, obj, vl, action, settings.cloth_warmup_frames, direction_name=direction_name)
+                        idx += 1
+                        bake_jobs.append({
+                            "type": "bake",
+                            "obj": obj,
+                            "vl": vl,
+                            "action": action,
+                            "direction_name": direction_name,
+                            "angle_radians": angle_radians,
+                            "bake_index": idx,
+                            "bake_total": total,
+                        })
             else:
-                # CAMERA mode: direction-agnostic, bake once per combo.
-                for i, (obj, vl, action) in enumerate(combos):
-                    settings.progress = f"Baking cloth ({i + 1}/{len(combos)})…"
-                    settings.progress_factor = (i + 1) / max(len(combos), 1)
-                    for area in context.screen.areas:
-                        area.tag_redraw()
-                    _bake_cloth_for_combo(context, obj, vl, action, settings.cloth_warmup_frames)
-
-            if settings.armature and settings.armature.animation_data:
-                settings.armature.animation_data.action = orig_action
-            context.window.view_layer = orig_vl
-            if rotation_rig and orig_rig_z is not None:
-                rotation_rig.rotation_euler.z = orig_rig_z
-            settings.progress = ""
-            settings.progress_factor = 0.0
+                total = len(combos)
+                for idx, (obj, vl, action) in enumerate(combos, 1):
+                    bake_jobs.append({
+                        "type": "bake",
+                        "obj": obj,
+                        "vl": vl,
+                        "action": action,
+                        "direction_name": None,
+                        "angle_radians": 0.0,
+                        "bake_index": idx,
+                        "bake_total": total,
+                    })
 
         jobs, result = _build_job_queue(context, self._export_root)
         if jobs is None:
             self.report({"ERROR"}, result)
             return {"CANCELLED"}
 
-        self._jobs = jobs
+        self._jobs = bake_jobs + jobs
         self._skipped = result
         self._job_index = 0
         self._render_total = sum(1 for j in jobs if j["type"] == "render")
@@ -1300,14 +1321,20 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         job = self._jobs[self._job_index]
 
         if job["type"] == "bake":
-            action = job["action"]
             settings = context.scene.spriteloom
-            context.scene.spriteloom.progress = f"Baking cloth: {action.name} / {job['compositor_name']}…"
-            _log(f"=== Cloth rebake on render: '{action.name}' / '{job['compositor_name']}' ===")
-            for vl_obj in context.scene.view_layers:
-                for obj in _get_cloth_objects_in_layer(vl_obj):
-                    _bake_cloth_for_combo(context, obj, vl_obj, action, settings.cloth_warmup_frames)
-            _log(f"=== Cloth rebake done ===")
+            obj = job["obj"]
+            action = job["action"]
+            direction_name = job["direction_name"]
+            bake_index = job["bake_index"]
+            bake_total = job["bake_total"]
+            dir_info = f" dir={direction_name}" if direction_name else ""
+            settings.progress = f"Baking cloth: {obj.name}/{action.name}{dir_info} ({bake_index}/{bake_total})…"
+            settings.progress_factor = bake_index / max(bake_total, 1)
+            _log(f"=== Pre-bake {bake_index}/{bake_total}: '{obj.name}'/'{action.name}'{dir_info} ===")
+            rotation_rig = settings.rotation_rig
+            if settings.rotation_mode == "OBJECT" and rotation_rig and direction_name:
+                rotation_rig.rotation_euler.z = -job["angle_radians"]
+            _bake_cloth_for_combo(context, job["obj"], job["vl"], action, settings.cloth_warmup_frames, direction_name=direction_name)
             self._job_index += 1
             return {"RUNNING_MODAL"}
 
@@ -1601,14 +1628,18 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 col.scale_y = 0.8
                 MAX_ROWS = 10
                 for obj, vl, action in combos[:MAX_ROWS]:
-                    baked = _is_combo_baked(vl.name, action.name)
+                    if settings.rotation_mode == "OBJECT":
+                        directions = _get_directions(settings.num_directions)
+                        baked = all(_is_combo_baked(vl.name, action.name, d[0]) for d in directions)
+                    else:
+                        baked = _is_combo_baked(vl.name, action.name)
                     row = col.row(align=True)
                     row.label(
                         text=f"{obj.name}  /  {vl.name}  /  {action.name}",
                         icon='CHECKMARK' if baked else 'BLANK1',
                     )
                     op = row.operator("spriteloom.bake_cloth", text="", icon='MOD_CLOTH', emboss=False)
-                    op.mode = "single"
+                    op.replace_existing = True
                     op.obj_name = obj.name
                     op.vl_name = vl.name
                     op.action_name = action.name
@@ -1616,9 +1647,9 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                     col.label(text=f"+{len(combos) - MAX_ROWS} more…", icon='BLANK1')
                 row = box.row(align=True)
                 op = row.operator("spriteloom.bake_cloth", text="Bake Missing", icon='MOD_CLOTH')
-                op.mode = "missing"
+                op.replace_existing = False
                 op = row.operator("spriteloom.bake_cloth", text="Rebake All", icon='FILE_REFRESH')
-                op.mode = "all"
+                op.replace_existing = True
                 row.operator("spriteloom.delete_bakes", text="Delete All", icon='TRASH')
                 box.prop(settings, "rebake_on_render")
             if settings.progress and "Baking" in settings.progress:

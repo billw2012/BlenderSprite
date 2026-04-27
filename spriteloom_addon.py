@@ -387,15 +387,15 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
     generated = 0
     errors = 0
 
-    # Beauty:  blendfile--action--compositor--direction--0024.png       (5-part stem)
-    # Normals: blendfile--action--compositor--direction--n--0024.png    (6-part stem)
+    # Beauty:  blendfile--scene--action--compositor--direction--0024.png      (6 parts)
+    # Normals: blendfile--scene--action--compositor--direction--0024--n.png  (7 parts)
     all_frames = []
     for fname in os.listdir(export_root):
         if not fname.lower().endswith(".png"):
             continue
         parts = fname[:-4].split("--")
         if frame_tag:
-            if len(parts) != 7 or parts[5] != frame_tag or not parts[6].isdigit():
+            if len(parts) != 7 or not parts[5].isdigit() or parts[6] != frame_tag:
                 continue
         else:
             if len(parts) != 6 or not parts[5].isdigit():
@@ -403,7 +403,7 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
         all_frames.append({
             "filepath": os.path.join(export_root, fname),
             "key": RenderKey.from_stem(parts),
-            "frame_num": int(parts[6 if frame_tag else 5]),
+            "frame_num": int(parts[5]),
         })
 
     if not all_frames:
@@ -632,26 +632,32 @@ def _bake_cloth_for_combo(context, obj, view_layer, action, warmup_frames, direc
 _NORMAL_OUTPUT_NODE_NAME = "Normal Output"
 
 
-def _rotate_normal_map_inplace(path, angle_radians):
+def _to_camera_space_inplace(path, cam_rot_3x3, flip_y=False):
     """
-    Rotate the XY channels of a world-space normal map PNG by -angle_radians so
-    that normals are expressed relative to the camera/screen rather than world space.
-    The Z channel (blue) is left unchanged — it encodes the toward-viewer component
-    which is constant for a camera that only orbits around the world Z axis.
+    Transform world-space normal map PNG to camera-space normals.
+    cam_rot_3x3: numpy 3x3 camera-to-world rotation matrix (from matrix_world.normalized().to_3x3()).
+    Applies the world-to-camera transform (transpose of cam_rot_3x3) to all three channels.
+    If flip_y=True, inverts the G channel (OpenGL → DirectX for Unreal Engine).
     """
     import numpy as np
     img = bpy.data.images.load(path, check_existing=False)
     try:
         w, h = img.size
         px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
-        # Remap R,G from [0,1] to [-1,1]
+        # Remap R,G,B from [0,1] to [-1,1]
         nx = px[:, :, 0] * 2.0 - 1.0
         ny = px[:, :, 1] * 2.0 - 1.0
-        # Rotate XY by -angle (inverse of camera rotation)
-        cos_a = math.cos(angle_radians)
-        sin_a = math.sin(angle_radians)
-        px[:, :, 0] = (nx * cos_a + ny * sin_a) * 0.5 + 0.5
-        px[:, :, 1] = (-nx * sin_a + ny * cos_a) * 0.5 + 0.5
+        nz = px[:, :, 2] * 2.0 - 1.0
+        # N_cam = M.T @ N_world — each output component is a dot with a column of M
+        R = cam_rot_3x3
+        nx_cam = R[0, 0] * nx + R[1, 0] * ny + R[2, 0] * nz
+        ny_cam = R[0, 1] * nx + R[1, 1] * ny + R[2, 1] * nz
+        nz_cam = R[0, 2] * nx + R[1, 2] * ny + R[2, 2] * nz
+        if flip_y:
+            ny_cam = -ny_cam
+        px[:, :, 0] = nx_cam * 0.5 + 0.5
+        px[:, :, 1] = ny_cam * 0.5 + 0.5
+        px[:, :, 2] = nz_cam * 0.5 + 0.5
         img.pixels = px.ravel().tolist()
         img.filepath_raw = path
         img.file_format = 'PNG'
@@ -1006,8 +1012,14 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         options=set(),
     )
     normal_correct_rotation: bpy.props.BoolProperty(  # type: ignore
-        name="Correct Rotation",
-        description="Rotate normal map XY channels to screen space after each render, compensating for camera orbit direction",
+        name="Camera Space",
+        description="Transform world-space normal map to camera space using the full inverse camera rotation (yaw + pitch)",
+        default=True,
+        options=set(),
+    )
+    normal_unreal_export: bpy.props.BoolProperty(  # type: ignore
+        name="Unreal Engine Export",
+        description="Flip the Y (G) channel of normal maps to DirectX convention for Unreal Engine",
         default=True,
         options=set(),
     )
@@ -1464,14 +1476,20 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             bpy.ops.render.render("EXEC_DEFAULT", write_still=True)
             _log(f"    OK  saved={out_path}")
             self._rendered += 1
-            if normal_node and settings.normal_correct_rotation:
+            if normal_node and (settings.normal_correct_rotation or settings.normal_unreal_export):
                 normal_path = os.path.join(
                     self._export_root,
                     job["out_stem"] + f"--{tag}.png",
                 )
                 if os.path.exists(normal_path):
-                    _rotate_normal_map_inplace(normal_path, job["angle_radians"])
-                    _log(f"    Normal rotated by {math.degrees(job['angle_radians']):.1f}°")
+                    import numpy as np
+                    if settings.normal_correct_rotation:
+                        cam_mat = scene.camera.matrix_world.normalized().to_3x3()
+                        cam_rot_3x3 = np.array(cam_mat, dtype=np.float32)
+                    else:
+                        cam_rot_3x3 = np.eye(3, dtype=np.float32)
+                    _to_camera_space_inplace(normal_path, cam_rot_3x3, flip_y=settings.normal_unreal_export)
+                    _log(f"    Normal: camera_space={settings.normal_correct_rotation} unreal_flip={settings.normal_unreal_export}")
                 else:
                     _log(f"    WARNING normal map not found at {normal_path}")
         except Exception as exc:
@@ -1768,7 +1786,8 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             row.prop(settings, "render_normals")
             if settings.render_normals:
                 row.prop(settings, "normal_tag", text="Tag")
-                row.prop(settings, "normal_correct_rotation", text="Correct Rotation", toggle=True)
+                row.prop(settings, "normal_correct_rotation", text="Camera Space", toggle=True)
+                row.prop(settings, "normal_unreal_export", text="Unreal Y-Flip", toggle=True)
                 row.prop(settings, "normal_write_json", text="Write JSON", toggle=True)
 
         # --- Sheet Layout ---

@@ -257,10 +257,29 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             rows_ordered.append(key)
         rows_map[key].append(f)
 
+    # Detect actual frame dimensions from first image
+    try:
+        _first_img = bpy.data.images.load(frames[0]["filepath"])
+        frame_w, frame_h = _first_img.size[0], _first_img.size[1]
+        bpy.data.images.remove(_first_img)
+    except Exception as exc:
+        _log(f"  ERROR: Could not load first frame to detect size: {exc}")
+        return False
+
+    # Validate against scene render resolution
+    _scene = bpy.context.scene
+    _pct = _scene.render.resolution_percentage / 100.0
+    _expected_w = int(_scene.render.resolution_x * _pct)
+    _expected_h = int(_scene.render.resolution_y * _pct)
+    if frame_w != _expected_w or frame_h != _expected_h:
+        _log(f"  ERROR: frame size {frame_w}×{frame_h} does not match "
+             f"scene render resolution {_expected_w}×{_expected_h}.")
+        return False
+
     num_rows = len(rows_ordered)
     cols = max(len(rows_map[k]) for k in rows_ordered)
-    sheet_w = FRAME_WIDTH * cols
-    sheet_h = FRAME_HEIGHT * num_rows
+    sheet_w = frame_w * cols
+    sheet_h = frame_h * num_rows
 
     sheet_png = os.path.join(spritesheet_root, f"{sheet_name}.png")
     sheet_json = os.path.join(spritesheet_root, f"{sheet_name}.json")
@@ -279,7 +298,7 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
             frame_index_map[id(f)] = i
 
     for row_idx, key in enumerate(rows_ordered):
-        y_px = row_idx * FRAME_HEIGHT
+        y_px = row_idx * frame_h
         for col_idx, f in enumerate(rows_map[key]):
             filepath = f["filepath"]
             filename = os.path.basename(filepath)
@@ -289,24 +308,26 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
                 _log(f"    WARNING: Could not load {filename}: {exc} — skipping.")
                 continue
 
-            if img.size[0] != FRAME_WIDTH or img.size[1] != FRAME_HEIGHT:
-                _log(f"    WARNING: {filename} is {img.size[0]}x{img.size[1]}, "
-                     f"expected {FRAME_WIDTH}x{FRAME_HEIGHT}.")
+            if img.size[0] != frame_w or img.size[1] != frame_h:
+                _log(f"    ERROR: {filename} is {img.size[0]}×{img.size[1]}, "
+                     f"expected {frame_w}×{frame_h} — skipping frame.")
+                bpy.data.images.remove(img)
+                continue
 
             arr = np.array(img.pixels, dtype=np.float32).reshape(img.size[1], img.size[0], 4)
             bpy.data.images.remove(img)
 
-            x_px = col_idx * FRAME_WIDTH
-            sheet_arr[y_px:y_px + FRAME_HEIGHT, x_px:x_px + FRAME_WIDTH, :] = arr[:FRAME_HEIGHT, :FRAME_WIDTH, :]
+            x_px = col_idx * frame_w
+            sheet_arr[y_px:y_px + frame_h, x_px:x_px + frame_w, :] = arr[:frame_h, :frame_w, :]
 
             display_num = frame_index_map[id(f)] if renumber_frames else f["frame_num"]
             sprite_name = f["key"].frame_name(frame_name_format or "", display_num, padding=frame_num_padding, tag=frame_tag or "")
             frames_meta[sprite_name] = {
-                "frame": {"x": x_px, "y": sheet_h - y_px - FRAME_HEIGHT, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
+                "frame": {"x": x_px, "y": sheet_h - y_px - frame_h, "w": frame_w, "h": frame_h},
                 "rotated": False,
                 "trimmed": False,
-                "spriteSourceSize": {"x": 0, "y": 0, "w": FRAME_WIDTH, "h": FRAME_HEIGHT},
-                "sourceSize": {"w": FRAME_WIDTH, "h": FRAME_HEIGHT},
+                "spriteSourceSize": {"x": 0, "y": 0, "w": frame_w, "h": frame_h},
+                "sourceSize": {"w": frame_w, "h": frame_h},
                 "duration": FRAME_DURATION_OVERRIDES.get(f["key"].action_name, FRAME_DURATION_MS),
             }
 
@@ -658,24 +679,30 @@ def _build_job_queue(context, export_root):
     settings = scene.spriteloom
 
     armature_obj = settings.armature
-    if armature_obj is None:
-        return None, "No armature selected"
-
     rotation_rig = settings.rotation_rig
-    if rotation_rig is None:
-        return None, "No rotation rig selected"
 
-    included_actions = _parse_include(settings.actions_include)
-    chr_actions = [a for a in bpy.data.actions if included_actions is None or a.name in included_actions]
-    if not chr_actions:
-        return None, "No actions to render (none in file or all excluded)"
+    is_static = armature_obj is None
+
+    if is_static:
+        import types as _types
+        static_action = _types.SimpleNamespace(
+            name="static",
+            frame_range=(scene.frame_current, scene.frame_current),
+            use_cyclic=False,
+        )
+        chr_actions = [static_action]
+    else:
+        included_actions = _parse_include(settings.actions_include)
+        chr_actions = [a for a in bpy.data.actions if included_actions is None or a.name in included_actions]
+        if not chr_actions:
+            return None, "No actions to render (none in file or all excluded)"
 
     compositors = _resolve_compositors(settings.compositors_include)
     if not compositors:
         return None, "No compositor node groups to render"
     compositor_iter = [(ng.name, ng) for ng in compositors]
 
-    directions = _get_directions(settings.num_directions)
+    directions = [("south", 0.0)] if rotation_rig is None else _get_directions(settings.num_directions)
     frame_step = settings.frame_step
     overwrite = settings.overwrite_frames
     blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else "untitled"
@@ -719,12 +746,14 @@ def _build_job_queue(context, export_root):
                         "compositor_ng": compositor_ng,
                         "direction_name": direction_name,
                         "angle_radians": angle_radians,
-                        "out_path": os.path.join(export_root, rkey.stem(frame) + ".png"),
+                        "out_stem": rkey.prefix()[:-2] if is_static else rkey.stem(frame),
+                        "out_path": os.path.join(export_root, (rkey.prefix()[:-2] if is_static else rkey.stem(frame)) + ".png"),
                         "frame": frame,
                         "frame_start": frame_start,
                         "frame_end": frame_end,
                         "armature_obj": armature_obj,
                         "rotation_rig": rotation_rig,
+                        "is_static": is_static,
                     })
         jobs.extend(action_jobs)
     return jobs, skipped
@@ -945,15 +974,15 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
     progress_factor: bpy.props.FloatProperty(default=0.0, options={'SKIP_SAVE'})  # type: ignore
     last_result: bpy.props.StringProperty(default="", options=set())  # type: ignore
     export_root: bpy.props.StringProperty(  # type: ignore
-        name="Export Root",
+        name="Intermediate Dir",
         description="Folder for rendered frames. // paths are relative to the .blend file",
         subtype='DIR_PATH',
         options={'PATH_SUPPORTS_BLEND_RELATIVE'},
         default="//export",
     )
     spritesheet_root: bpy.props.StringProperty(  # type: ignore
-        name="Spritesheet Root",
-        description="Folder for packed sprite sheets. // paths are relative to the .blend file",
+        name="Final Dir",
+        description="Folder for packed sprite sheets and static renders. // paths are relative to the .blend file",
         subtype='DIR_PATH',
         options={'PATH_SUPPORTS_BLEND_RELATIVE'},
         default="//spritesheets",
@@ -1284,6 +1313,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         self._jobs = bake_jobs + jobs
         self._skipped = result
         self._job_index = 0
+        self._is_static = any(j.get("is_static") for j in jobs)
         self._render_total = sum(1 for j in jobs if j["type"] == "render")
         self._rendered = 0
         self._errors = 0
@@ -1368,25 +1398,29 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         scene.spriteloom.progress_factor = self._rendered / self._render_total if self._render_total else 0.0
         context.window_manager.progress_update(self._rendered)
 
-        if armature_obj.animation_data is None:
-            armature_obj.animation_data_create()
-        orig_use_nla = armature_obj.animation_data.use_nla
-        if orig_use_nla:
-            _log(f"  [render] disabling NLA on '{armature_obj.name}' (was enabled) to prevent T-pose override")
-            armature_obj.animation_data.use_nla = False
-        _log(f"  [render] assigning action '{action.name}' to '{armature_obj.name}'")
-        armature_obj.animation_data.action = action
+        orig_use_nla = False
+        if armature_obj is not None:
+            if armature_obj.animation_data is None:
+                armature_obj.animation_data_create()
+            orig_use_nla = armature_obj.animation_data.use_nla
+            if orig_use_nla:
+                _log(f"  [render] disabling NLA on '{armature_obj.name}' (was enabled) to prevent T-pose override")
+                armature_obj.animation_data.use_nla = False
+            _log(f"  [render] assigning action '{action.name}' to '{armature_obj.name}'")
+            armature_obj.animation_data.action = action
 
-        if settings.rotation_mode == "OBJECT":
-            rotation_rig.rotation_euler.z = -job["angle_radians"]
-        else:
-            rotation_rig.rotation_euler.z = job["angle_radians"]
+        if rotation_rig is not None:
+            if settings.rotation_mode == "OBJECT":
+                rotation_rig.rotation_euler.z = -job["angle_radians"]
+            else:
+                rotation_rig.rotation_euler.z = job["angle_radians"]
         scene.frame_set(frame)
         out_path = job["out_path"]
 
+        rig_z_str = f"{rotation_rig.rotation_euler.z:.3f}" if rotation_rig is not None else "n/a"
         _log(
             f"  RENDER  {job['key'].label()}  frame={frame}  "
-            f"rig_z={rotation_rig.rotation_euler.z:.3f}"
+            f"rig_z={rig_z_str}"
         )
 
         fmt = scene.render.image_settings
@@ -1418,7 +1452,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 tag = settings.normal_tag.replace("-", "").strip()
                 normal_node.directory = self._export_root
                 # file_name has no extension — Blender appends .png automatically
-                normal_node.file_name = job["key"].stem(frame, tag=tag)
+                normal_node.file_name = job["out_stem"] + f"--{tag}"
                 normal_node.file_output_items[0].name = ""
                 normal_node.format.file_format = "PNG"
 
@@ -1433,7 +1467,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             if normal_node and settings.normal_correct_rotation:
                 normal_path = os.path.join(
                     self._export_root,
-                    job["key"].stem(frame, tag=tag) + ".png",
+                    job["out_stem"] + f"--{tag}.png",
                 )
                 if os.path.exists(normal_path):
                     _rotate_normal_map_inplace(normal_path, job["angle_radians"])
@@ -1454,7 +1488,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             fmt.file_format = orig_file_format
             fmt.color_mode = orig_color_mode
             scene.compositing_node_group = orig_compositor
-            if armature_obj.animation_data and armature_obj.animation_data.use_nla != orig_use_nla:
+            if armature_obj is not None and armature_obj.animation_data and armature_obj.animation_data.use_nla != orig_use_nla:
                 _log(f"  [render] restoring NLA on '{armature_obj.name}' to {orig_use_nla}")
                 armature_obj.animation_data.use_nla = orig_use_nla
 
@@ -1495,43 +1529,65 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         context.scene.spriteloom.progress_factor = 0.0
 
         _log(f"\n=== Render complete — rendered {self._rendered}, skipped {self._skipped}, errors {self._errors} ===")
-        _log("=== SpriteLoom: Packing sprites ===")
 
         settings = context.scene.spriteloom
-        packed, pack_skipped, pack_errors = _run_pack(
-            self._export_root, self._spritesheet_root,
-            settings.sheet_name_format,
-            set(settings.split_axes), set(settings.row_split_axes),
-            settings.renumber_frames, settings.frame_num_padding,
-            frame_name_format=settings.frame_name_format,
-        )
-
-        _log(f"=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
-
-        total_errors = self._errors + pack_errors
+        total_errors = self._errors
         result_lines = [
             f"Rendered: {self._rendered}  Skipped: {self._skipped}  Errors: {self._errors}",
-            f"Sheets: {packed}  Skipped: {pack_skipped}  Errors: {pack_errors}",
         ]
 
-        if settings.render_normals:
-            normal_tag = settings.normal_tag.replace("-", "").strip()
-            _log("=== SpriteLoom: Packing normal map sprites ===")
-            n_packed, n_skipped, n_errors = _run_pack(
+        if self._is_static:
+            _log("=== SpriteLoom: Static render — copying to final dir ===")
+            import shutil
+            os.makedirs(self._spritesheet_root, exist_ok=True)
+            copied = 0
+            for j in self._jobs:
+                if j.get("type") != "render":
+                    continue
+                src = j["out_path"]
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(self._spritesheet_root, os.path.basename(src)))
+                    copied += 1
+                # also copy normal pass if present
+                if settings.render_normals:
+                    tag = settings.normal_tag.replace("-", "").strip()
+                    normal_src = os.path.join(self._export_root, j["out_stem"] + f"--{tag}.png")
+                    if os.path.exists(normal_src):
+                        shutil.copy2(normal_src, os.path.join(self._spritesheet_root, os.path.basename(normal_src)))
+                        copied += 1
+            _log(f"=== Static copy complete — {copied} file(s) copied ===")
+            result_lines.append(f"Static render — {copied} file(s) copied to final dir")
+        else:
+            _log("=== SpriteLoom: Packing sprites ===")
+            packed, pack_skipped, pack_errors = _run_pack(
                 self._export_root, self._spritesheet_root,
                 settings.sheet_name_format,
                 set(settings.split_axes), set(settings.row_split_axes),
                 settings.renumber_frames, settings.frame_num_padding,
-                frame_tag=normal_tag, frame_name_format=settings.frame_name_format,
-                write_json=settings.normal_write_json,
+                frame_name_format=settings.frame_name_format,
             )
-            _log(f"=== Normal pack complete — {n_packed} generated, {n_skipped} skipped, {n_errors} errors ===")
-            total_errors += n_errors
-            result_lines.append(f"Normal sheets: {n_packed}  Skipped: {n_skipped}  Errors: {n_errors}")
+            _log(f"=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
+            total_errors += pack_errors
+            result_lines.append(f"Sheets: {packed}  Skipped: {pack_skipped}  Errors: {pack_errors}")
+
+            if settings.render_normals:
+                normal_tag = settings.normal_tag.replace("-", "").strip()
+                _log("=== SpriteLoom: Packing normal map sprites ===")
+                n_packed, n_skipped, n_errors = _run_pack(
+                    self._export_root, self._spritesheet_root,
+                    settings.sheet_name_format,
+                    set(settings.split_axes), set(settings.row_split_axes),
+                    settings.renumber_frames, settings.frame_num_padding,
+                    frame_tag=normal_tag, frame_name_format=settings.frame_name_format,
+                    write_json=settings.normal_write_json,
+                )
+                _log(f"=== Normal pack complete — {n_packed} generated, {n_skipped} skipped, {n_errors} errors ===")
+                total_errors += n_errors
+                result_lines.append(f"Normal sheets: {n_packed}  Skipped: {n_skipped}  Errors: {n_errors}")
 
         context.scene.spriteloom.last_result = "\n".join(result_lines)
         self.report({"WARNING"} if total_errors > 0 else {"INFO"},
-                    f"Render {self._rendered} | Pack {packed} | Errors {total_errors}")
+                    f"Render {self._rendered} | Pack {packed if not self._is_static else 'n/a'} | Errors {total_errors}")
 
 
 # ---------------------------------------------------------------------------
@@ -1565,11 +1621,15 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             box.prop(settings, "armature")
             box.prop(settings, "rotation_rig")
             rot_row = box.row(align=True)
+            rot_row.enabled = settings.rotation_rig is not None
             rot_row.label(text="Rotation:")
             rot_row.prop(settings, "rotation_mode", expand=True)
-            box.prop(settings, "num_directions")
+            dir_row = box.row()
+            dir_row.enabled = settings.rotation_rig is not None
+            dir_row.prop(settings, "num_directions")
             box.prop(settings, "frame_step")
             actions_box = box.box()
+            actions_box.enabled = settings.armature is not None
             hrow = actions_box.row(align=False)
             hrow.label(text="Actions", icon="ACTION")
             rhs = hrow.row(align=True)
@@ -1613,6 +1673,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
                 actions_box.label(text="No actions in file", icon='INFO')
         # --- Cloth Simulation ---
         box = layout.box()
+        box.enabled = settings.armature is not None
         row = box.row()
         row.prop(settings, "show_cloth",
                  icon="TRIA_DOWN" if settings.show_cloth else "TRIA_RIGHT",
@@ -1785,16 +1846,17 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         issues = []
 
         if settings.armature is None:
-            issues.append(("ERROR", "No armature selected"))
+            issues.append(("INFO", "No armature — rendering 1 frame (static, no sprite sheet)"))
         if settings.rotation_rig is None:
-            issues.append(("ERROR", "No rotation rig selected"))
+            issues.append(("INFO", "No rotation rig — rendering 1 direction"))
 
-        _included = _parse_include(settings.actions_include)
-        chr_actions = [a for a in bpy.data.actions if _included is None or a.name in _included]
-        if not chr_actions:
-            issues.append(("ERROR", "No actions to render (none in file or none checked)"))
-            if bpy.data.actions:
-                issues.append(("INFO", "Hint: check at least one action above"))
+        if settings.armature is not None:
+            _included = _parse_include(settings.actions_include)
+            chr_actions = [a for a in bpy.data.actions if _included is None or a.name in _included]
+            if not chr_actions:
+                issues.append(("ERROR", "No actions to render (none in file or none checked)"))
+                if bpy.data.actions:
+                    issues.append(("INFO", "Hint: check at least one action above"))
 
         if not _resolve_compositors(settings.compositors_include):
             issues.append(("ERROR", "No compositor node groups to render"))

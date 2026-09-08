@@ -653,6 +653,23 @@ def _resolve_path(prop_value):
     return bpy.path.abspath(prop_value)
 
 
+def _scene_export_root(scene):
+    """Where this scene's frames live: the intermediate dir, or a subdir of it per scene.
+
+    One directory per asset is what makes Clean Before Render safe. Flat, the clean has to
+    decide which of the frames it can see belong to the render it is about to do, and the
+    answer is a guess -- so it refuses whenever it cannot tell, and a project sharing one
+    intermediate dir can never clean at all. Given a directory of its own, everything in it
+    is by construction this asset's.
+    """
+    settings = scene.spriteloom
+    base = _resolve_path(settings.export_root)
+    if not base or not settings.export_subdir_per_scene:
+        return base
+    blendfile = os.path.splitext(os.path.basename(bpy.data.filepath))[0] or "untitled"
+    return os.path.join(base, f"{blendfile}--{scene.name}")
+
+
 @dataclass(frozen=True)
 class RenderKey:
     """Bundles all naming identity fields for a rendered frame or sprite sheet."""
@@ -1972,6 +1989,16 @@ class SpriteLoomSettings(bpy.types.PropertyGroup):
         options={'PATH_SUPPORTS_BLEND_RELATIVE'},
         default="//export",
     )
+    export_subdir_per_scene: bpy.props.BoolProperty(  # type: ignore
+        name="Frames In Per-Scene Subdir",
+        description=(
+            "Write this scene's frames into <Intermediate Dir>/<blendfile>--<scene>/ rather "
+            "than loose in the intermediate dir. Turn this off only when the intermediate "
+            "dir holds one asset: sharing it flat means Clean Before Render sees another "
+            "asset's frames as deletable, and the pack sees them as packable"
+        ),
+        default=True,
+    )
     spritesheet_root: bpy.props.StringProperty(  # type: ignore
         name="Final Dir",
         description="Folder for packed sprite sheets and static renders. // paths are relative to the .blend file",
@@ -2319,7 +2346,7 @@ def build_plan(context=None):
         context = bpy.context
     scene = context.scene
     settings = scene.spriteloom
-    export_root = _resolve_path(settings.export_root)
+    export_root = _scene_export_root(scene)
     spritesheet_root = _resolve_path(settings.spritesheet_root)
 
     plan = {
@@ -2633,7 +2660,7 @@ def refresh_sockets(actions=None, compositors=None, directions=None, context=Non
         intent["directions"] = directions
 
     with _temp_settings(context, **intent):
-        export_root = _resolve_path(settings.export_root)
+        export_root = _scene_export_root(scene)
         sheet_root = _resolve_path(settings.spritesheet_root)
         jobs, skipped = _build_job_queue(context, export_root, dry_run=True)
         if jobs is None:
@@ -2763,8 +2790,10 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
         if settings.cam_auto_apply:
             bpy.ops.spriteloom.setup_camera()
 
-        self._export_root = _resolve_path(settings.export_root)
+        self._export_root = _scene_export_root(context.scene)
         self._spritesheet_root = _resolve_path(settings.spritesheet_root)
+        if self._export_root:
+            os.makedirs(self._export_root, exist_ok=True)
 
         if not self._export_root:
             self.report({"ERROR"}, "Save the .blend file first, or set an explicit Export Root path.")
@@ -3538,6 +3567,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
             comp_box.prop(settings, "auto_sync_compositors")
 
             box.prop(settings, "export_root")
+            box.prop(settings, "export_subdir_per_scene")
             box.prop(settings, "spritesheet_root")
             box.prop(settings, "clean_output")
             box.prop(settings, "overwrite_frames")
@@ -3708,7 +3738,7 @@ class SPRITELOOM_PT_Main(bpy.types.Panel):
         # export root while actions_include narrows what gets written back.
         _clean_casualties = {}
         if bpy.data.filepath:
-            _export_for_check = _resolve_path(settings.export_root)
+            _export_for_check = _scene_export_root(context.scene)
             if _export_for_check:
                 _clean_casualties = _clean_output_casualties(context, _export_for_check)
         if _clean_casualties:

@@ -936,13 +936,25 @@ def _pack_sheet(np, spritesheet_root, sheet_name, frames,
 def _run_pack(export_root, spritesheet_root, sheet_name_format,
               split_axes: set, row_split_axes: set,
               renumber_frames=True, frame_num_padding=2,
-              frame_tag=None, frame_name_format=None, written=None, frame_transform=None):
+              frame_tag=None, frame_name_format=None, written=None, frame_transform=None,
+              owned_by=None):
     """Pack all rendered frames into sprite sheets. Returns (generated, skipped, errors).
 
     frame_transform: passed to _pack_sheet for every sheet.
 
     written: optional list; each successfully packed sheet's path is appended to it, so
              the run status can report real output paths instead of counts alone.
+
+    owned_by: set of (blendfile, scene) pairs this render covers. Frames in export_root
+              belonging to anything else are left alone. The export root is shared between
+              assets in some projects, and without this the pack rebuilds EVERY sheet whose
+              frames happen to be sitting there -- using THIS scene's sheet_name_format, which
+              for a {scene}-tokenised format reproduces the other asset's real sheet name and
+              overwrites it. Worse, it rebuilds it from whatever frames are on disk: frames
+              rendered before per-frame pivot sidecars existed pack into a sheet with no
+              pivots at all, so a shipped sheet silently loses data that nothing regenerates.
+              None means pack everything, which is the old behaviour and only safe when the
+              export root holds one asset.
 
     frame_tag: sanitized tag string (no dashes, e.g. 'n'). When set, only 7-part stems are
                parsed (blendfile--scene--action--compositor--direction--frame--tag), the tag
@@ -970,6 +982,7 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
     # Beauty:  blendfile--scene--action--compositor--direction--0024.png      (6 parts)
     # Tagged:  blendfile--scene--action--compositor--direction--0024--n.png   (7 parts)
     all_frames = []
+    skipped_foreign = 0
     for fname in os.listdir(export_root):
         ext = os.path.splitext(fname)[1].lower()
         if ext not in _IMAGE_EXT_TO_FORMAT:
@@ -982,12 +995,19 @@ def _run_pack(export_root, spritesheet_root, sheet_name_format,
         else:
             if len(parts) != 6 or not parts[5].isdigit():
                 continue
+        key = RenderKey.from_stem(parts)
+        if owned_by is not None and (key.blendfile, key.scene_name) not in owned_by:
+            skipped_foreign += 1
+            continue
         all_frames.append({
             "filepath": os.path.join(export_root, fname),
             "ext": ext,
-            "key": RenderKey.from_stem(parts),
+            "key": key,
             "frame_num": int(parts[5]),
         })
+
+    if skipped_foreign:
+        _log(f"  {skipped_foreign} frame(s) in the export root belong to another asset — left alone.")
 
     if not all_frames:
         _log("  WARNING: No frames found to pack.")
@@ -3193,6 +3213,10 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
             result_lines.append(f"Static render — {copied} file(s) copied to final dir")
         else:
             _log("=== SpriteLoom: Packing sprites ===")
+            # The scenes this render covered. Frames in a shared export root belonging to
+            # any other asset are not ours to repack.
+            owned_by = {(j["key"].blendfile, j["key"].scene_name)
+                        for j in self._jobs if j.get("key") is not None}
             beauty_paths = []
             packed, pack_skipped, pack_errors = _run_pack(
                 self._export_root, self._spritesheet_root,
@@ -3200,6 +3224,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                 set(settings.split_axes), set(settings.row_split_axes),
                 settings.renumber_frames, settings.frame_num_padding,
                 frame_name_format=settings.frame_name_format, written=beauty_paths,
+                owned_by=owned_by,
             )
             _log(f"=== Pack complete — generated {packed}, skipped {pack_skipped}, errors {pack_errors} ===")
             total_errors += pack_errors
@@ -3214,7 +3239,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     set(settings.split_axes), set(settings.row_split_axes),
                     settings.renumber_frames, settings.frame_num_padding,
                     frame_tag=normal_tag, frame_name_format=settings.frame_name_format,
-                    written=normal_paths,
+                    written=normal_paths, owned_by=owned_by,
                 )
                 _log(f"=== Normal pack complete — {n_packed} generated, {n_skipped} skipped, {n_errors} errors ===")
                 total_errors += n_errors
@@ -3229,7 +3254,7 @@ class SPRITELOOM_OT_RenderAll(bpy.types.Operator):
                     set(settings.split_axes), set(settings.row_split_axes),
                     settings.renumber_frames, settings.frame_num_padding,
                     frame_tag=depth_tag, frame_name_format=settings.frame_name_format,
-                    written=depth_paths,
+                    written=depth_paths, owned_by=owned_by,
                     frame_transform=_depth_rebase_transform(self._export_root, depth_tag),
                 )
                 _log(f"=== Depth pack complete — {d_packed} generated, {d_skipped} skipped, {d_errors} errors ===")
